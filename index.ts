@@ -1358,6 +1358,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "link_send",
     label: "Link Send",
+    loadMode: "essential",
     description: [
       "Send a message to another Pi terminal on the link.",
       'Use to:"*" for broadcast. Set triggerTurn:true to make the receiving terminal\'s LLM respond.',
@@ -1434,6 +1435,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "link_compact",
     label: "Link Compact",
+    loadMode: "essential",
     description: [
       "Ask another Pi terminal to compact its context window and wait until it finishes.",
       "Returns once the target has compacted, so you can immediately send it new work.",
@@ -1542,6 +1544,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "link_prompt",
     label: "Link Prompt",
+    loadMode: "essential",
     description: [
       "Send a prompt to another Pi terminal and wait for its LLM to respond.",
       "The remote terminal processes the prompt as if a user typed it,",
@@ -1672,6 +1675,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "link_list",
     label: "Link List",
+    loadMode: "essential",
     description: "List all Pi terminals currently connected to the link.",
     promptSnippet: "List connected Pi terminals on the link",
     parameters: Type.Object({}),
