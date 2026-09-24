@@ -295,11 +295,18 @@ if (teamIndex === 0) {
   }
   if (subcommand === "check") {
     if (!inventory.manifest) {
-      console.error("No team manifest found. Expected .pi-link/team.yml, team.yaml, or team.json.");
+      console.error("No team manifest found. Expected .pi-link/team.json.");
       process.exit(1);
     }
     const result = validateTeamConfig(inventory.manifest, {
-      existingPaths: new Set(inventory.profiles.map((profile) => profile.path)),
+      // A declared prompt/config is a file; a declared cwd/sessionDir is a
+      // directory. Both must already exist, so a manifest cannot promise a
+      // location the launcher would have to invent.
+      existingPaths: new Set([
+        ...inventory.profiles.map((profile) => profile.path),
+        ...inventory.sessionConfigs.map((config) => config.path),
+      ]),
+      existingDirs: inventory.existingDirs,
       skillIds: new Set(inventory.skills.map((skill) => skill.id)),
     });
     for (const error of result.errors) console.error(`ERROR ${error}`);

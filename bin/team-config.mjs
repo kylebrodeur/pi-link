@@ -1,13 +1,23 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { parse as parseYaml } from 'yaml';
 
+// Team composition manifest. JSON only, matching pi-link's own configuration
+// surface: the CLI already parses JSON for settings.json, session entries,
+// package.json and the hub status payload, and the wire protocol is JSON.
+// A JSON manifest needs no runtime dependency, so pi-link keeps its single
+// runtime dependency (`ws`).
+//
+// The manifest is looked up side by side with Pi's own config, not inside it:
+// `.pi-link/` is pi-link's namespace, so a team manifest never writes into
+// Pi's `<cwd>/.pi/settings.json`.
 const MANIFEST_CANDIDATES = [
-  '.pi-link/team.yml',
-  '.pi-link/team.yaml',
   '.pi-link/team.json',
 ];
 
+// Pi/OMP profile frontmatter is YAML-shaped, but every field we read is a flat
+// `key: value` scalar. Pi's own subagent tooling parses those by hand and keeps
+// a YAML library for complex nested fields only, so we follow that precedent
+// instead of taking a dependency to read four strings.
 const PROFILE_ROOTS = ['.omp/agents', '.agents'];
 const SKILL_ROOTS = ['.omp/skills', '.agents/skills', 'skills'];
 const SCRIPT_ROOT = 'scripts';
@@ -21,34 +31,144 @@ async function exists(filePath) {
   }
 }
 
-async function walkFiles(root) {
+// Classify a dirent that may be a symlink. `withFileTypes` reports a symlink as
+// neither file nor directory, so a skills tree that links a skill in from
+// elsewhere (e.g. `.omp/skills/<name>` -> `../../.claude/skills/...`) would be
+// skipped entirely. Resolve those before deciding.
+async function classify(entryPath, entry) {
+  if (entry.isDirectory()) return 'dir';
+  if (entry.isFile()) return 'file';
+  if (!entry.isSymbolicLink()) return 'other';
+  try {
+    const stat = await fs.stat(entryPath);
+    if (stat.isDirectory()) return 'dir';
+    if (stat.isFile()) return 'file';
+  } catch {
+    // A broken link is not an error here; it simply contributes nothing.
+  }
+  return 'other';
+}
+
+// Profile roots hold profile files directly (`<root>/advisor.md`,
+// `<root>/tester.agent.md`). They must not be walked recursively: an
+// `.agents/` root also contains `skills/`, and recursing pulls every bundled
+// skill document in as a bogus profile.
+async function listFiles(root, extension) {
   if (!(await exists(root))) return [];
   const entries = await fs.readdir(root, { withFileTypes: true });
   const files = [];
   for (const entry of entries) {
-    const filePath = path.join(root, entry.name);
-    if (entry.isDirectory()) files.push(...await walkFiles(filePath));
-    else files.push(filePath);
+    const entryPath = path.join(root, entry.name);
+    const kind = await classify(entryPath, entry);
+    if (kind === 'file' && (!extension || entry.name.endsWith(extension))) files.push(entryPath);
   }
   return files;
 }
 
-function parseManifest(text, manifestPath) {
-  if (manifestPath.endsWith('.json')) return JSON.parse(text);
-  const parsed = parseYaml(text);
-  // An empty manifest is a valid but empty configuration, not a parse failure.
-  return parsed ?? {};
+// Skill roots nest one level (`<root>/<skill-name>/SKILL.md`), so this one
+// recurses; the caller filters on the exact `SKILL.md` basename.
+async function walkFiles(root, basename) {
+  if (!(await exists(root))) return [];
+  const entries = await fs.readdir(root, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    const kind = await classify(entryPath, entry);
+    if (kind === 'dir') {
+      files.push(...(await walkFiles(entryPath, basename)));
+    } else if (kind === 'file' && (!basename || entry.name === basename)) {
+      files.push(entryPath);
+    }
+  }
+  return files;
 }
 
-function parseFrontmatter(text) {
-  if (!text.startsWith('---')) return {};
-  const end = text.indexOf('\n---', 3);
-  if (end < 0) return {};
-  try {
-    return parseYaml(text.slice(4, end)) ?? {};
-  } catch {
-    return {};
+// Immediate subdirectories of a root. Two levels are enough for the layouts a
+// team uses: `.omp/<team-name>/<role>` session dirs and `<root>/<skill>/`.
+async function listDirs(root, depth = 2) {
+  if (!(await exists(root)) || depth < 1) return [];
+  const dirs = [];
+  for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+    const entryPath = path.join(root, entry.name);
+    if ((await classify(entryPath, entry)) !== 'dir') continue;
+    dirs.push(entryPath);
+    dirs.push(...(await listDirs(entryPath, depth - 1)));
   }
+  return dirs;
+}
+
+// Read the flat `key: value` scalars from YAML-shaped frontmatter. Values keep
+// their text; quotes are stripped, inline lists split on commas. This is not a
+// YAML parser and does not try to be: nested mappings, block scalars, anchors
+// and multi-line strings are out of scope, and a field using them is simply not
+// reported rather than mis-reported.
+function parseFrontmatter(text) {
+  const fields = {};
+  if (!text.startsWith('---')) return fields;
+  const end = text.indexOf('\n---', 3);
+  if (end < 0) return fields;
+
+  for (const line of text.slice(4, end).split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    // Only top-level scalars: a leading indent means a nested block we skip.
+    if (/^\s/.test(line)) continue;
+    const separator = line.indexOf(':');
+    if (separator < 1) continue;
+    const key = line.slice(0, separator).trim();
+    const rawValue = line.slice(separator + 1).trim();
+    if (!rawValue) continue;
+    if (rawValue.startsWith('|') || rawValue.startsWith('>')) continue;
+    fields[key] = parseScalar(rawValue);
+  }
+  return fields;
+}
+
+function parseScalar(rawValue) {
+  if (
+    (rawValue.startsWith('"') && rawValue.endsWith('"')) ||
+    (rawValue.startsWith("'") && rawValue.endsWith("'"))
+  ) {
+    return rawValue.slice(1, -1);
+  }
+  if (rawValue.startsWith('[') && rawValue.endsWith(']')) {
+    const body = rawValue.slice(1, -1).trim();
+    return body ? body.split(',').map((item) => parseScalar(item.trim())) : [];
+  }
+  return rawValue;
+}
+
+// A JSON manifest must be a plain object. `JSON.parse` yields `null`, an array,
+// a scalar, or an object; only the last is a usable manifest. The prototype
+// check names the shape at the boundary without a runtime `typeof` narrowing.
+function isPlainJsonObject(value) {
+  return value !== null && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+// Parse a JSON manifest at its I/O boundary. A manifest that is not a JSON
+// object (array, scalar, null) is a malformed manifest, so the shape is
+// rejected here rather than re-inspected at each use site.
+function parseManifestJson(text, manifestPath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (cause) {
+    throw new Error(`team manifest is not valid JSON: ${manifestPath}`, { cause });
+  }
+  if (!isPlainJsonObject(parsed)) {
+    throw new Error(`team manifest must be a JSON object: ${manifestPath}`);
+  }
+  return parsed;
+}
+
+// Frontmatter values arrive from `parseScalar`, which yields a string or an
+// array of strings. Normalise both shapes into a list of skill ids.
+function toStringList(value) {
+  if (Array.isArray(value)) return value.map((item) => `${item}`);
+  if (!value) return [];
+  return `${value}`
+    .split(',')
+    .map((skill) => skill.trim())
+    .filter(Boolean);
 }
 
 function normalizeRole(role, root) {
@@ -64,7 +184,11 @@ function normalizeRole(role, root) {
       denied: role.tools?.denied ?? role.deniedTools ?? [],
     },
   };
-  for (const key of ['profile', 'prompt', 'sessionDir', 'cwd']) {
+  // Launch facts a role declares. `profile`/`prompt`/`config` are files;
+  // `sessionDir`/`cwd` are directories. All are repo-relative by convention and
+  // resolved against the repo root, so a manifest never carries absolute paths
+  // that only work on one machine.
+  for (const key of ['profile', 'prompt', 'config', 'sessionDir', 'cwd']) {
     if (normalized[key] && !path.isAbsolute(normalized[key])) normalized[key] = path.resolve(root, normalized[key]);
   }
   return normalized;
@@ -74,9 +198,10 @@ export async function loadTeamConfig(root) {
   for (const relativePath of MANIFEST_CANDIDATES) {
     const manifestPath = path.join(root, relativePath);
     if (!(await exists(manifestPath))) continue;
-    const text = await fs.readFile(manifestPath, 'utf8');
-    const parsed = parseManifest(text, manifestPath);
-    const roles = Object.fromEntries(Object.entries(parsed.roles ?? {}).map(([name, role]) => [name, normalizeRole(role, root)]));
+    const parsed = parseManifestJson(await fs.readFile(manifestPath, 'utf8'), manifestPath);
+    const roles = Object.fromEntries(
+      Object.entries(parsed.roles ?? {}).map(([name, role]) => [name, normalizeRole(role, root)]),
+    );
     return {
       ...parsed,
       manifestPath,
@@ -90,31 +215,29 @@ export async function loadTeamConfig(root) {
 export async function discoverTeam(root) {
   const profiles = [];
   for (const relativeRoot of PROFILE_ROOTS) {
-    for (const filePath of await walkFiles(path.join(root, relativeRoot))) {
-      if (!filePath.endsWith('.md')) continue;
+    for (const filePath of await listFiles(path.join(root, relativeRoot), '.md')) {
       const frontmatter = parseFrontmatter(await fs.readFile(filePath, 'utf8'));
       profiles.push({
         path: filePath,
         id: path.basename(filePath).replace(/\.agent\.md$|\.md$/, ''),
         role: frontmatter.role ?? frontmatter.type ?? null,
-        capabilities: Array.isArray(frontmatter.capabilities) ? frontmatter.capabilities : [],
+        model: frontmatter.model ?? null,
+        skills: toStringList(frontmatter.autoloadSkills),
       });
     }
   }
 
   const skills = [];
   for (const relativeRoot of SKILL_ROOTS) {
-    for (const filePath of await walkFiles(path.join(root, relativeRoot))) {
-      if (path.basename(filePath) !== 'SKILL.md') continue;
+    for (const filePath of await walkFiles(path.join(root, relativeRoot), 'SKILL.md')) {
       const relativeRootPath = path.join(root, relativeRoot);
-      const relative = path.relative(relativeRootPath, filePath);
-      const parts = relative.split(path.sep);
+      const parts = path.relative(relativeRootPath, filePath).split(path.sep);
       skills.push({ path: filePath, id: parts.length > 1 ? parts[0] : path.basename(path.dirname(filePath)) });
     }
   }
 
   const launchScripts = [];
-  for (const filePath of await walkFiles(path.join(root, SCRIPT_ROOT))) {
+  for (const filePath of await listFiles(path.join(root, SCRIPT_ROOT), null)) {
     if (!/\.(sh|bash|zsh|mjs|js|py)$/.test(filePath)) continue;
     const basename = path.basename(filePath).toLowerCase();
     const body = await fs.readFile(filePath, 'utf8');
@@ -123,18 +246,53 @@ export async function discoverTeam(root) {
     }
   }
 
+  // Per-session OMP config overlays (`--config`), e.g. `.omp/light-session.yml`.
+  const sessionConfigs = [];
+  for (const filePath of await listFiles(path.join(root, '.omp'), null)) {
+    if (/\.ya?ml$/.test(filePath)) {
+      sessionConfigs.push({ path: filePath, id: path.basename(filePath) });
+    }
+  }
+
+  // Directories a role can legitimately point at. The scan roots below cover the
+  // team's own layout, but a role's working directory can be any directory in
+  // the repo (`iot-rig/ui-lab`), so directories named by the manifest itself are
+  // added too. Without this, a declared cwd outside `.omp/` could never
+  // validate. Only directories that actually exist are recorded.
+  const existingDirs = new Set();
+  for (const relativeRoot of ['.', '.omp', SCRIPT_ROOT]) {
+    const rootPath = path.join(root, relativeRoot);
+    if (await exists(rootPath)) existingDirs.add(rootPath);
+  }
+  for (const relativeRoot of ['.omp', SCRIPT_ROOT]) {
+    for (const dir of await listDirs(path.join(root, relativeRoot))) {
+      existingDirs.add(dir);
+    }
+  }
+  const declared = await loadTeamConfig(root);
+  for (const role of Object.values(declared?.roles ?? {})) {
+    for (const key of ['cwd', 'sessionDir']) {
+      if (role[key] && (await exists(role[key]))) existingDirs.add(role[key]);
+    }
+  }
+
   return {
     root,
-    manifest: await loadTeamConfig(root),
+    manifest: declared,
     profiles: profiles.sort((a, b) => a.path.localeCompare(b.path)),
     skills: skills.sort((a, b) => a.id.localeCompare(b.id)),
     launchScripts: launchScripts.sort((a, b) => a.path.localeCompare(b.path)),
+    sessionConfigs: sessionConfigs.sort((a, b) => a.id.localeCompare(b.id)),
+    existingDirs,
   };
 }
 
 export function validateTeamConfig(config, inventory) {
   const errors = [];
   const warnings = [];
+  // Tolerate a caller that supplies only file paths: directory checks are
+  // then simply unavailable rather than crashing.
+  const existingDirs = inventory.existingDirs ?? new Set();
   if (!config || config.version !== 1) errors.push('team config version must be 1');
   if (!config?.team?.name) errors.push('team.name is required');
   if (!config?.team?.group) errors.push('team.group is required');
@@ -144,9 +302,27 @@ export function validateTeamConfig(config, inventory) {
     errors.push(`hub.role "${config.hub.role}" does not name a configured role`);
   }
   const linkNames = new Map();
+  const linkDirs = new Map();
   for (const [name, role] of Object.entries(config?.roles ?? {})) {
     if (!role.profile) errors.push(`roles.${name}.profile is required`);
     else if (!inventory.existingPaths.has(role.profile)) errors.push(`roles.${name}.profile is missing: ${role.profile}`);
+    // Optional launch facts: when declared, they must exist. A role that points
+    // at a directory the launcher will not create is the failure this catches.
+    for (const key of ['prompt', 'config']) {
+      if (role[key] && !inventory.existingPaths.has(role[key])) {
+        errors.push(`roles.${name}.${key} is missing: ${role[key]}`);
+      }
+    }
+    // `cwd` must already exist: a role cannot start in a directory that is not
+    // there. `sessionDir` is different — launchers create it (`mkdir -p`) before
+    // first use, so a missing one is normal on a clean checkout and is reported
+    // as a warning, not an error.
+    if (role.cwd && !existingDirs.has(role.cwd)) {
+      errors.push(`roles.${name}.cwd is not an existing directory: ${role.cwd}`);
+    }
+    if (role.sessionDir && !existingDirs.has(role.sessionDir)) {
+      warnings.push(`roles.${name}.sessionDir does not exist yet (created on first launch): ${role.sessionDir}`);
+    }
     for (const skill of role.skills?.required ?? []) {
       if (!inventory.skillIds.has(skill)) errors.push(`roles.${name}.skills.required references missing skill: ${skill}`);
     }
@@ -158,6 +334,13 @@ export function validateTeamConfig(config, inventory) {
       if (previous) errors.push(`roles.${name}.linkName duplicates roles.${previous}: ${role.linkName}`);
       linkNames.set(role.linkName, name);
     }
+    // Two roles sharing a session dir would resume the same history under
+    // different identities; that is a composition mistake, not a preference.
+    if (role.sessionDir) {
+      const previous = linkDirs.get(role.sessionDir);
+      if (previous) errors.push(`roles.${name}.sessionDir is shared with roles.${previous}: ${role.sessionDir}`);
+      linkDirs.set(role.sessionDir, name);
+    }
   }
   return { errors, warnings };
 }
@@ -167,8 +350,14 @@ export function formatTeamReport(result) {
   lines.push(`Root: ${result.root}`);
   lines.push(result.manifest ? `Manifest: ${result.manifest.manifestPath}` : 'Manifest: none');
   lines.push(`Profiles (${result.profiles.length}):`);
-  for (const profile of result.profiles) lines.push(`  ${profile.id}${profile.role ? ` (${profile.role})` : ''} — ${profile.path}`);
+  for (const profile of result.profiles) {
+    const bits = [profile.role ? ` (${profile.role})` : '', profile.model ? ` · ${profile.model}` : ''].join('');
+    lines.push(`  ${profile.id}${bits} — ${profile.path}`);
+  }
   lines.push(`Skills (${result.skills.length}): ${result.skills.map((skill) => skill.id).join(', ') || 'none'}`);
+  if (result.sessionConfigs?.length) {
+    lines.push(`Session configs: ${result.sessionConfigs.map((config) => config.id).join(', ')}`);
+  }
   lines.push(`Launch scripts (${result.launchScripts.length}):`);
   for (const script of result.launchScripts) lines.push(`  ${script.id} — ${script.path}`);
   return lines.join('\n');

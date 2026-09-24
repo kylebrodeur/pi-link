@@ -32,43 +32,28 @@ test('loads a JSON team manifest and normalizes role paths relative to the repos
   assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
 });
 
-test('loads a YAML team manifest using standard YAML features', async () => {
+test('a YAML manifest is not picked up, so the JSON path stays authoritative', async () => {
   const root = await tempRepo();
   await fs.mkdir(path.join(root, '.pi-link'));
-  await fs.writeFile(path.join(root, '.pi-link', 'team.yml'), [
-    'version: 1',
-    'team:',
-    '  name: demo',
-    '  group: demo',
-    'hub:',
-    '  role: advisor',
-    '  mode: designated',
-    'roles:',
-    '  advisor:',
-    '    role: coordinator',
-    '    profile: .omp/agents/advisor.md',
-    // A colon inside a quoted scalar must not be treated as a key separator.
-    '    summary: "Coordinate: keep peers unblocked"',
-    '    skills:',
-    '      required: [team-workflow]',
-    '    tools:',
-    '      required: [read]',
-    '      requestable:',
-    '        - browser',
-    '  builder:',
-    '    role: member',
-    // A block scalar with real newlines must survive parsing intact.
-    '    instructions: |',
-    '      Build the thing.',
-    '      Then verify it.',
-  ].join('\n'));
+  await fs.writeFile(path.join(root, '.pi-link', 'team.yml'), 'version: 1\nteam:\n  name: demo\n');
 
-  const config = await loadTeamConfig(root);
-  assert.equal(config.team.group, 'demo');
-  assert.equal(config.roles.advisor.summary, 'Coordinate: keep peers unblocked');
-  assert.deepEqual(config.roles.advisor.skills.required, ['team-workflow']);
-  assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
-  assert.equal(config.roles.builder.instructions, 'Build the thing.\nThen verify it.\n');
+  assert.equal(await loadTeamConfig(root), null);
+});
+
+test('rejects a manifest that is not a JSON object', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.pi-link'));
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), '[1, 2, 3]');
+
+  await assert.rejects(() => loadTeamConfig(root), /must be a JSON object/);
+});
+
+test('reports malformed JSON as a read failure rather than a partial config', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.pi-link'));
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), '{ "version": 1,');
+
+  await assert.rejects(() => loadTeamConfig(root));
 });
 
 test('discovers profiles, skills, and launch scripts without writing files', async () => {
@@ -89,6 +74,55 @@ test('discovers profiles, skills, and launch scripts without writing files', asy
   ].sort());
   assert.deepEqual(result.skills.map((entry) => entry.id), ['workflow']);
   assert.deepEqual(result.launchScripts.map((entry) => entry.path), [path.join(root, 'scripts', 'start-team.sh')]);
+});
+
+test('does not treat skill reference documents as profiles', async () => {
+  const root = await tempRepo();
+  // `.agents/` holds both profiles and a `skills/` tree; a recursive profile
+  // scan would report every bundled skill .md as a role.
+  await fs.mkdir(path.join(root, '.agents', 'skills', 'workflow'), { recursive: true });
+  await fs.writeFile(path.join(root, '.agents', 'tester.agent.md'), '---\nrole: member\n---\n');
+  await fs.writeFile(path.join(root, '.agents', 'skills', 'workflow', 'SKILL.md'), '# Workflow');
+  await fs.writeFile(path.join(root, '.agents', 'skills', 'workflow', 'reference.md'), '# Ref');
+
+  const result = await discoverTeam(root);
+  assert.deepEqual(result.profiles.map((entry) => entry.id), ['tester']);
+});
+
+test('follows a symlinked skill directory', async () => {
+  const root = await tempRepo();
+  // Real repos link skills in from elsewhere (e.g. .omp/skills/<name> ->
+  // ../../.claude/skills/...). readdir reports a symlink as neither file nor
+  // directory, so an unresolved walker silently drops the skill.
+  await fs.mkdir(path.join(root, 'shared', 'team-workflow'), { recursive: true });
+  await fs.writeFile(path.join(root, 'shared', 'team-workflow', 'SKILL.md'), '# Workflow');
+  await fs.mkdir(path.join(root, '.omp', 'skills'), { recursive: true });
+  await fs.symlink(
+    path.join(root, 'shared', 'team-workflow'),
+    path.join(root, '.omp', 'skills', 'team-workflow'),
+  );
+
+  const result = await discoverTeam(root);
+  assert.deepEqual(result.skills.map((entry) => entry.id), ['team-workflow']);
+});
+
+test('reads the flat frontmatter fields a real profile declares', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'advisor.md'), [
+    '---',
+    'name: advisor',
+    'description: Coordinates the team',
+    'model: glm-5.2:cloud',
+    'autoloadSkills: team-workflow, context-management',
+    '---',
+    'Body text that must not be parsed as a field.',
+  ].join('\n'));
+
+  const result = await discoverTeam(root);
+  const [profile] = result.profiles;
+  assert.equal(profile.model, 'glm-5.2:cloud');
+  assert.deepEqual(profile.skills, ['team-workflow', 'context-management']);
 });
 
 test('reports missing required profile and hub role as validation errors', async () => {
