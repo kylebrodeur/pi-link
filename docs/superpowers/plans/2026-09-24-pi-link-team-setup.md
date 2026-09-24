@@ -4,9 +4,9 @@
 
 **Goal:** Extend pi-link with discovery, validation, and gradual setup of repository-defined Pi/OMP agent teams without duplicating existing profiles, skills, tools, or project policy.
 
-**Architecture:** Add a small team-config library used by additive `pi-link team` commands. The library discovers existing repository artifacts and validates a `.pi-link/team.yml`/`.yaml`/`.json` composition manifest. Existing agent profiles remain authoritative for role prompts and model data; Pi/OMP remains authoritative over actual runtime tools and skills; existing pi-link group routing remains unchanged.
+**Architecture:** Add a small team-config library under the existing `bin/` CLI boundary, used by additive `pi-link team` commands. The library discovers existing repository artifacts and validates a `.pi-link/team.yml`/`.yaml`/`.json` composition manifest. Existing agent profiles remain authoritative for role prompts and model data; Pi/OMP remains authoritative over actual runtime tools and skills; existing pi-link group routing remains unchanged.
 
-**Tech Stack:** Node.js ESM CLI, JSON, YAML via the existing Pi runtime's `yaml` package where available and an explicit package dependency for published CLI use, Node built-in test runner, Markdown skills.
+**Tech Stack:** Node.js ESM CLI, JSON, YAML via a direct runtime dependency selected after parser verification, Node built-in test runner, Markdown skills.
 
 **Spec:** The reviewed design in the conversation preceding this plan: single-machine local teams, discovery first, manifest validation, capability reporting, advisor requests later, no remote transport/authentication in this sequence.
 
@@ -25,9 +25,9 @@
 ## Task 1: Stabilize the discovery slice
 
 **Files:**
-- Modify: `package.json` — include `lib` in published files and add the chosen YAML parser dependency.
+- Modify: `package.json` — add the chosen YAML parser dependency; keep the existing `files` allowlist unchanged because the helper lives under `bin/`.
 - Modify: `package-lock.json` — lock the runtime dependency.
-- Modify: `lib/team-config.mjs` — replace the restricted YAML parser with the selected parser API; retain JSON support.
+- Modify: `bin/team-config.mjs` — replace the restricted YAML parser with the selected parser API; retain JSON support.
 - Modify: `README.md` — add team discovery/manifest documentation without replacing existing sections.
 - Modify: `test/team-config.test.mjs` — cover real YAML features accepted by the parser.
 - Modify: `test/cli-team.test.mjs` — add packed-artifact smoke coverage if practical.
@@ -36,22 +36,22 @@
 
 **Steps:**
 
-- [ ] Add `lib` to `package.json.files`.
+- [ ] Keep the existing `package.json.files` allowlist; do not add a new top-level package boundary.
 - [ ] Add the chosen YAML library to `dependencies`.
-- [ ] Replace the hand-rolled parser with the library parser.
+- [ ] Replace the hand-rolled parser.
 - [ ] Add a YAML fixture containing quoted strings, nested objects, arrays, and a multiline instruction.
 - [ ] Run `node --test test/team-config.test.mjs test/cli-team.test.mjs` and confirm the tests pass.
-- [ ] Run `npm pack --dry-run` and confirm `lib/team-config.mjs` is listed.
+- [ ] Run `npm pack --dry-run` and confirm both `bin/pi-link.mjs` and `bin/team-config.mjs` are listed.
 - [ ] Pack into a temporary directory and run the packaged `bin/pi-link.mjs --version` and `team discover` commands.
-- [ ] Add the README section documenting commands, manifest ownership, and the `lib` package boundary.
+- [ ] Add the README section documenting commands and manifest ownership.
 - [ ] Commit as `feat: stabilize pi-link team discovery`.
 
-**Acceptance:** Existing CLI behavior still passes its focused smoke checks; YAML parsing is standards-based; the packed npm artifact contains `bin`, `lib`, and `skills`; discovery and validation work from both the checkout and packed artifact.
+**Acceptance:** Existing CLI behavior still passes its focused smoke checks; YAML parsing is standards-based; the packed npm artifact contains the existing `bin` and `skills` trees, including both CLI modules; discovery and validation work from both the checkout and packed artifact.
 
 ## Task 2: Add manifest proposal mode
 
 **Files:**
-- Modify: `lib/team-config.mjs` — add deterministic proposal generation from discovered profiles/skills/scripts.
+- Modify: `bin/team-config.mjs` — add deterministic proposal generation from discovered profiles/skills/scripts.
 - Modify: `bin/pi-link.mjs` — add `pi-link team init --dry-run`.
 - Create: `test/team-init.test.mjs`.
 - Modify: `README.md` — document proposal behavior.
@@ -71,7 +71,7 @@ The proposal must identify likely coordinator roles only from explicit profile m
 
 **Files:**
 - Modify: `bin/pi-link.mjs` — add interactive `pi-link team init`.
-- Modify: `lib/team-config.mjs` — add safe manifest write helper.
+- Modify: `bin/team-config.mjs` — add safe manifest write helper.
 - Create: `test/team-init-write.test.mjs`.
 
 **Interface:**
@@ -85,12 +85,10 @@ writeTeamConfig(root, config, { force?: boolean }) -> Promise<string>
 ## Task 4: Add profile and capability inventory
 
 **Files:**
-- Modify: `lib/team-config.mjs` — parse recognized Markdown frontmatter and manifest capability declarations.
+- Modify: `bin/team-config.mjs` — parse recognized Markdown frontmatter and manifest capability declarations.
 - Modify: `bin/pi-link.mjs` — show per-role profile/model/role/skill/tool state.
 - Create: `test/team-capabilities.test.mjs`.
 - Modify: `skills/pi-link-team-setup/SKILL.md` — document capability state semantics.
-
-**Capability states:**
 
 ```text
 present, missing, optional-missing, requestable, denied, unknown

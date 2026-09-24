@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'fixtures');
-const cli = path.resolve(root, '../../bin/pi-link.mjs');
+const cli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../bin/pi-link.mjs');
 
 function run(args) {
   return new Promise((resolve) => {

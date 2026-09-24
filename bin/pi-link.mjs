@@ -17,7 +17,7 @@ import { createInterface } from "readline";
 import { join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
-import { discoverTeam, formatTeamReport, validateTeamConfig } from "../lib/team-config.mjs";
+import { discoverTeam, formatTeamReport, validateTeamConfig } from "./team-config.mjs";
 
 // Canonicalize a link/session name: trim + collapse internal whitespace.
 // Must match the extension's normalizeName (index.ts).
