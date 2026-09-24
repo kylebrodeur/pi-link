@@ -17,6 +17,7 @@ import { createInterface } from "readline";
 import { join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
+import { discoverTeam, formatTeamReport, validateTeamConfig } from "../lib/team-config.mjs";
 
 // Canonicalize a link/session name: trim + collapse internal whitespace.
 // Must match the extension's normalizeName (index.ts).
@@ -265,6 +266,42 @@ function renderTable(rows, columns) {
 // ── CLI ────────────────────────────────────────────────────────────────────
 
 const rawArgs = process.argv.slice(2);
+const teamIndex = rawArgs.indexOf("team");
+if (teamIndex === 0) {
+  const subcommand = rawArgs[1];
+  if (!["discover", "show", "check", "explain"].includes(subcommand) || rawArgs.length !== 2) {
+    console.error("Usage: pi-link team discover|show|check|explain");
+    process.exit(64);
+  }
+  const inventory = await discoverTeam(process.cwd());
+  if (subcommand === "discover" || subcommand === "explain") console.log(formatTeamReport(inventory));
+  if (subcommand === "show") {
+    console.log(formatTeamReport(inventory));
+    if (inventory.manifest) {
+      console.log(`\nTeam: ${inventory.manifest.team?.name ?? "unnamed"}`);
+      console.log(`Group: ${inventory.manifest.team?.group ?? "unset"}`);
+      console.log(`Hub role: ${inventory.manifest.hub?.role ?? "unset"}`);
+      for (const [name, role] of Object.entries(inventory.manifest.roles ?? {})) {
+        console.log(`  ${name}${role.role ? ` (${role.role})` : ""}${role.linkName ? ` → ${role.linkName}` : ""}`);
+      }
+    }
+  }
+  if (subcommand === "check") {
+    if (!inventory.manifest) {
+      console.error("No team manifest found. Expected .pi-link/team.yml, team.yaml, or team.json.");
+      process.exit(1);
+    }
+    const result = validateTeamConfig(inventory.manifest, {
+      existingPaths: new Set(inventory.profiles.map((profile) => profile.path)),
+      skillIds: new Set(inventory.skills.map((skill) => skill.id)),
+    });
+    for (const error of result.errors) console.error(`ERROR ${error}`);
+    for (const warning of result.warnings) console.error(`WARN ${warning}`);
+    if (result.errors.length) process.exit(1);
+    console.log(`Team manifest valid: ${inventory.manifest.manifestPath}`);
+  }
+  process.exit(0);
+}
 
 // Reject Pi flags that pi-link manages, plus --link-name (which exists at the
 // `pi` level for link-only naming, but the wrapper's combined-mode contract
@@ -307,6 +344,7 @@ function printHelp() {
   console.error("       pi-link --list [--global|-g]");
   console.error("       pi-link --status [--json]");
   console.error("       pi-link --resolve <name> [--global|-g]");
+  console.error("       pi-link team discover|show|check|explain");
   console.error("       pi-link --version");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
