@@ -36,9 +36,8 @@ while the **documentation** is committed so the fork explains how its own gate w
 
 ## Exclude mechanism
 
-`git config extensions.worktreeConfig true` then `git config --worktree core.hooksPath .husky`
-scopes hooks to this worktree; the main checkout keeps no `hooksPath`, so upstream
-work is unaffected.
+`git config core.hooksPath .husky` scopes the hook to this checkout; the committed
+history keeps no hook, so upstream work is unaffected.
 
 The machinery is ignored via **`.git/info/exclude`** (uncommitted by design):
 
@@ -128,8 +127,9 @@ pi-link has none, so:
 
 ## The trufflehog index bug (important)
 
-The recipe's trufflehog line is unsafe inside a **pre-commit hook in a git
-worktree**, and the failure is silent data loss:
+The recipe's trufflehog line is unsafe inside a **pre-commit hook in a checkout
+that has `GIT_DIR`/`GIT_INDEX_FILE` set** (a git worktree is the common case), and
+the failure is silent data loss:
 
 > git exports `GIT_DIR` and `GIT_INDEX_FILE` to hooks. trufflehog's internal git
 > plumbing inherits them, so it writes through the **real** index and unstages
@@ -157,14 +157,14 @@ Verified both directions after the fix:
 - slop file → commit **blocked**, exit 1, HEAD unmoved, file still staged
 - clean file → commit **succeeded**, content present in the commit
 
-Not reproducible in a plain checkout, only when `GIT_DIR`/`GIT_INDEX_FILE` are set
-— which is exactly what a worktree hook gets. Anyone running the recipe's hook in
-a worktree should apply this scrub.
+Not reproducible in a plain checkout, only when `GIT_DIR`/`GIT_INDEX_FILE` are set.
+Anyone running the recipe's hook where those are exported — a worktree, or a
+`git commit` invoked from tooling that sets them — should apply this scrub.
 
 ## Re-verifying the gate end to end
 
 ```bash
-cd /private/tmp/pi-link-team-setup
+cd /Users/kylebrodeur/workspace/pi-link
 
 # 1. slop must be blocked
 printf 'export function f(v){ if (typeof v === "string") return 1; return 2; }\n' > tmp-slop.mjs
@@ -188,6 +188,5 @@ git reset --hard HEAD~1; rm -f tmp-clean.mjs
 rm -rf tools oxlint.config.ts .husky
 rm -rf node_modules        # or: npm prune (removes the --no-save packages)
 # remove the four lines from .git/info/exclude
-git config --worktree --unset core.hooksPath
-git config --unset extensions.worktreeConfig   # optional
+git config --unset core.hooksPath
 ```
