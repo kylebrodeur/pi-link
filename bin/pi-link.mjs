@@ -6,6 +6,7 @@
 //   pi-link <name> [--global|-g] [flags...]
 //                                Resume or create a named session, connected to link.
 //   pi-link --list [--global|-g] List pi-link sessions in current cwd (or everywhere).
+//   pi-link --status [--json]   Show terminals connected to the running hub right now.
 //   pi-link --resolve <name> [--global|-g]
 //                                Print just the session path (machine-readable).
 //   pi-link --version            Print the installed pi-link version.
@@ -71,25 +72,42 @@ function resolveSessionDir(cwd, agentDir) {
 }
 
 // Reads a session JSONL file and returns its display name, cwd, id, link
-// status, and message count.
+// status, and message count. Returns null when `scopeCwd` is given and the
+// session's header names a different cwd.
 //
 // Name precedence: latest valid `link-name` custom entry wins as the
 // authoritative pi-link name. `session_info.name` is only a fallback for
 // sessions that never set a link-name. Historical link-names are not aliases.
-async function getSessionMeta(filePath) {
+//
+// A scoped scan only ever keeps sessions from `scopeCwd`, so a session whose
+// header names another cwd is abandoned there instead of being read to EOF for
+// a name that would be filtered out anyway. Pi writes that header as the first
+// complete line of the file, before any history.
+//
+// Only `undefined` means unscoped: a normalized scope is the empty string at
+// POSIX root, which is a real scope and must not read as "no scope".
+async function getSessionMeta(filePath, scopeCwd) {
   let linkName;
   let sessionName;
   let cwd;
   let id;
   let hasLinkName = false;
   let messages = 0;
-  const rl = createInterface({ input: createReadStream(filePath, "utf-8"), crlfDelay: Infinity });
+  const input = createReadStream(filePath, "utf-8");
+  const rl = createInterface({ input, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line) continue;
     try {
       const entry = JSON.parse(line);
       if (entry.type === "session") {
-        if (typeof entry.cwd === "string") cwd = entry.cwd;
+        if (typeof entry.cwd === "string") {
+          if (scopeCwd !== undefined && normalizePath(entry.cwd) !== scopeCwd) {
+            rl.close();
+            input.destroy();
+            return null;
+          }
+          cwd = entry.cwd;
+        }
         if (typeof entry.id === "string") id = entry.id;
       } else if (entry.type === "session_info" && typeof entry.name === "string") {
         sessionName = normalizeName(entry.name) || undefined;
@@ -134,6 +152,11 @@ const useAnsi =
 const bold = (s) => (useAnsi ? `\x1b[1m${s}\x1b[22m` : s);
 const dim = (s) => (useAnsi ? `\x1b[2m${s}\x1b[22m` : s);
 
+// What `--status` prints for a field the hub could not report. Declared here,
+// above the dispatcher: the mode handlers are hoisted functions, but a `const`
+// read from one would still be in its temporal dead zone when dispatch runs.
+const UNKNOWN = "?";
+
 function relTime(d) {
   const sec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
   if (sec < 60) return `${sec}s ago`;
@@ -146,9 +169,10 @@ function relTime(d) {
   return d.toISOString().slice(0, 10);
 }
 
-async function loadSessionRecord(filePath) {
+async function loadSessionRecord(filePath, scopeCwd) {
   try {
-    const meta = await getSessionMeta(filePath);
+    const meta = await getSessionMeta(filePath, scopeCwd);
+    if (!meta) return null; // known-foreign: not even worth a stat
     const stats = await stat(filePath);
     return { ...meta, modified: stats.mtime, path: filePath };
   } catch {
@@ -156,11 +180,12 @@ async function loadSessionRecord(filePath) {
   }
 }
 
-// Returns meta + mtime + path for every readable session in `dir`. Custom
-// layout is flat (<dir>/*.jsonl); default layout has one subdir level per
-// encoded cwd (<dir>/<sub>/*.jsonl). Errors on individual files/dirs are
-// silently skipped — active or partially-written sessions are tolerated.
-async function scanSessions(dir, isCustom) {
+// Returns meta + mtime + path for every readable session in `dir`, or only
+// those from `scopeCwd` when it is given. Custom layout is flat
+// (<dir>/*.jsonl); default layout has one subdir level per encoded cwd
+// (<dir>/<sub>/*.jsonl). Errors on individual files/dirs are silently skipped
+// — active or partially-written sessions are tolerated.
+async function scanSessions(dir, isCustom, scopeCwd) {
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
@@ -172,7 +197,7 @@ async function scanSessions(dir, isCustom) {
   if (isCustom) {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-      tasks.push(loadSessionRecord(join(dir, entry.name)));
+      tasks.push(loadSessionRecord(join(dir, entry.name), scopeCwd));
     }
   } else {
     for (const sub of entries) {
@@ -182,7 +207,7 @@ async function scanSessions(dir, isCustom) {
       try { files = await readdir(subPath); } catch { continue; }
       for (const file of files) {
         if (!file.endsWith(".jsonl")) continue;
-        tasks.push(loadSessionRecord(join(subPath, file)));
+        tasks.push(loadSessionRecord(join(subPath, file), scopeCwd));
       }
     }
   }
@@ -190,28 +215,28 @@ async function scanSessions(dir, isCustom) {
   return (await Promise.all(tasks)).filter((s) => s !== null);
 }
 
-// Find sessions whose current display name matches `targetName`. Returns both
-// local-cwd matches and all matches (cross-cwd) so the caller can default to
-// local while still surfacing a hint when non-local matches exist. Falls back
-// to `session_info.name` for sessions without a link-name (so `pi-link <name>`
+// Find sessions whose current display name matches `targetName`, restricted to
+// `scopeCwd` when given and searched across every cwd when not. Falls back to
+// `session_info.name` for sessions without a link-name (so `pi-link <name>`
 // can attach link to a previously-unlinked named session).
-async function findSessionsByName(targetName, dir, isCustom) {
-  const localCwd = normalizePath(process.cwd());
-  const all = (await scanSessions(dir, isCustom))
+//
+// The cwd predicate is applied here as well as in the scan: a session whose
+// header carries no cwd is not rejected early, and must still be left out of a
+// scoped result.
+async function findSessionsByName(targetName, dir, isCustom, scopeCwd) {
+  return (await scanSessions(dir, isCustom, scopeCwd))
     .filter((s) => s.name === targetName)
+    .filter((s) => scopeCwd === undefined || (s.cwd && normalizePath(s.cwd) === scopeCwd))
     .map((s) => ({ path: s.path, cwd: s.cwd || "?", modified: s.modified }))
     .sort((a, b) => b.modified.getTime() - a.modified.getTime());
-  const local = all.filter((s) => normalizePath(s.cwd) === localCwd);
-  return { local, all };
 }
 
-// List pi-link sessions (those with at least one link-name entry). Default
-// scope is current cwd; `all` widens to every directory.
-async function listSessions({ all, dir, isCustom }) {
-  const localCwd = normalizePath(process.cwd());
-  return (await scanSessions(dir, isCustom))
+// List pi-link sessions (those with at least one link-name entry), restricted
+// to `scopeCwd` when given and covering every cwd when not.
+async function listSessions({ dir, isCustom, scopeCwd }) {
+  return (await scanSessions(dir, isCustom, scopeCwd))
     .filter((s) => s.hasLinkName)
-    .filter((s) => all || (s.cwd && normalizePath(s.cwd) === localCwd))
+    .filter((s) => scopeCwd === undefined || (s.cwd && normalizePath(s.cwd) === scopeCwd))
     .map((s) => ({
       name: s.name || "(unnamed)",
       cwd: s.cwd || "?",
@@ -280,11 +305,13 @@ function fail(msg) {
 function printHelp() {
   console.error("Usage: pi-link <name> [--global|-g] [pi flags...]");
   console.error("       pi-link --list [--global|-g]");
+  console.error("       pi-link --status [--json]");
   console.error("       pi-link --resolve <name> [--global|-g]");
   console.error("       pi-link --version");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
   console.error("--global / -g widens the search to sessions in any cwd.");
+  console.error("--list reads saved sessions; --status asks the running hub who is connected.");
 }
 
 function printVersion() {
@@ -303,6 +330,7 @@ function describeMode(mode) {
     case "help": return "--help";
     case "version": return "--version";
     case "list": return "--list";
+    case "status": return "--status";
     case "resolve": return "--resolve";
     case "launcher": return "session name";
     default: return mode;
@@ -312,17 +340,18 @@ function describeMode(mode) {
 // ── Parser ─────────────────────────────────────────────────────────────────
 //
 // Single sequential pass populates `state`; dispatcher reads it. Phases:
-//   1. Global flags (--global, --help, --version, --)
-//   2. Mode-selecting flags (--list, --resolve, --resolve=<name>)
+//   1. Global flags (--global, --help, --version, --json, --)
+//   2. Mode-selecting flags (--list, --status, --resolve, --resolve=<name>)
 //   3. Mode-specific extra-token rejection
 //   4. Launcher mode entry (mode null + bare positional)
 //   5. Launcher passthrough (mode launcher) with orphan-positional rejection
 
 const state = {
-  mode: null, // null | "help" | "version" | "list" | "resolve" | "launcher"
+  mode: null, // null | "help" | "version" | "list" | "status" | "resolve" | "launcher"
   resolveName: null,
   launcherName: null,
   global: false,
+  json: false,
   piPassthrough: [],
 };
 
@@ -364,9 +393,23 @@ for (let i = 0; i < rawArgs.length; i++) {
     break;
   }
 
+  // `--json` modifies --status only. Claimed before a mode exists so order does
+  // not matter, but never in launcher mode, where it belongs to pi.
+  if (a === "--json" && (state.mode === null || state.mode === "status")) {
+    state.json = true;
+    continue;
+  }
+
   // Phase 2: mode-selecting flags.
   if (a === "--list") {
     setMode("list");
+    continue;
+  }
+  // Selects the wrapper's own mode only before a session name has been seen.
+  // After that it is pi's flag, exactly like `--json` above — intercepting it
+  // unconditionally would break `pi-link foo --status`.
+  if (a === "--status" && state.mode !== "launcher") {
+    setMode("status");
     continue;
   }
   if (a.startsWith("--resolve=")) {
@@ -396,6 +439,9 @@ for (let i = 0; i < rawArgs.length; i++) {
   }
   if (state.mode === "list") {
     fail(`--list does not accept argument: ${a}\n  Usage: pi-link --list [--global|-g]`);
+  }
+  if (state.mode === "status") {
+    fail(`--status does not accept arguments: ${a}\n  Usage: pi-link --status [--json]`);
   }
   if (state.mode === "resolve") {
     fail(`--resolve accepts exactly one name; got extra: ${a}`);
@@ -446,6 +492,14 @@ if (state.mode === "resolve") {
   }
   state.resolveName = normalized;
 }
+// `--status` reads one running hub, so a cwd scope is meaningless rather than
+// merely unused: silently ignoring `-g` would imply a filter that cannot exist.
+if (state.mode === "status" && state.global) {
+  fail(`cannot combine --status and --global`);
+}
+if (state.json && state.mode !== "status") {
+  fail(`--json is only valid with --status`);
+}
 if (state.mode === "launcher") {
   const normalized = normalizeName(state.launcherName);
   if (!normalized) {
@@ -469,6 +523,9 @@ switch (state.mode) {
   case "list":
     await runList(state);
     break;
+  case "status":
+    await runStatus(state);
+    break;
   case "resolve":
     await runResolve(state);
     break;
@@ -481,9 +538,14 @@ switch (state.mode) {
 
 // ── Mode handlers ──────────────────────────────────────────────────────────
 
+// A local operation scans only its own cwd; `--global` scans every cwd.
+function localScope(state) {
+  return state.global ? undefined : normalizePath(process.cwd());
+}
+
 async function runList(state) {
   const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const sessions = await listSessions({ all: state.global, dir, isCustom });
+  const sessions = await listSessions({ dir, isCustom, scopeCwd: localScope(state) });
   if (sessions.length === 0) {
     console.log(state.global ? "No pi-link sessions found." : "No pi-link sessions found in this cwd.");
     console.log("Start one: pi-link <name>");
@@ -510,11 +572,145 @@ async function runList(state) {
   }
 }
 
+// ── Status (live hub query) ────────────────────────────────────────────────
+//
+// `--list` reads saved history; `--status` asks the hub who is connected now.
+// The two answer different questions, so they share no code path.
+
+// Mirrors the extension's formatTokens so both renderings of one number agree.
+function formatTokens(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1000)}K`;
+  return `${n}`;
+}
+
+// `92K/272K (34%)`, or `?/272K` when the hub has a window but no token count.
+// Only reached for a validated payload, so `c` is null or a well-typed snapshot;
+// a non-positive window is still possible and still means nothing to report.
+function formatContext(c) {
+  if (!c || c.window <= 0) return UNKNOWN;
+  const window = formatTokens(c.window);
+  if (typeof c.tokens !== "number") return `${UNKNOWN}/${window}`;
+  return `${formatTokens(c.tokens)}/${window} (${Math.round((c.tokens / c.window) * 100)}%)`;
+}
+
+function formatAge(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
+// `status` and `sinceSeconds` are an optional pair: the hub omits them for a
+// terminal it has registered but not yet heard from. Absence means unknown, so
+// it must render as unknown — printing `idle` there would be an invention, and
+// acting on it is the misreporting this command exists to end.
+function formatTerminalStatus(entry) {
+  if (typeof entry.status !== "string") return UNKNOWN;
+  return `${entry.status} (${formatAge(entry.sinceSeconds)})`;
+}
+
+function failUnsupported() {
+  console.error("Link hub does not support /status \u2014 update pi-link and restart terminals.");
+  process.exit(1);
+}
+
+function failNoHub(port) {
+  console.error(`No link hub running on :${port}.`);
+  process.exit(2);
+}
+
+// The fields the table reads, checked before any of them is read. A body that
+// lacks them or mistypes them — a different service, a truncated proxy, a newer
+// hub gone incompatible — must produce the unsupported message, never a stack
+// trace. Passing says the rows can be printed, nothing more: what the CLI never
+// prints it never checks, so the hub's payload invariants, and whether a hub sent
+// this at all, are not established here.
+function isContextField(c) {
+  if (c === null) return true;
+  if (!c || typeof c !== "object") return false;
+  return (c.tokens === null || typeof c.tokens === "number") && typeof c.window === "number";
+}
+
+function isTerminalEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  if (typeof entry.name !== "string") return false;
+  // `status` and `sinceSeconds` are one optional pair: both or neither.
+  //
+  // The value is checked for shape, not vocabulary. `idle`/`thinking`/
+  // `compacting`/`tool:<name>` are today's kinds, but that set has already grown
+  // once (`compacting`, in 0.3.0) and the CLI never branches on it — it
+  // only prints it. Freezing the list here would make a newer hub's fifth kind
+  // reject the whole payload, and only while some terminal happened to be in that
+  // state: an intermittent failure telling the user to update. An empty string is
+  // still rejected, because it renders as a blank cell with a bare duration.
+  const hasStatus = "status" in entry;
+  if (hasStatus !== ("sinceSeconds" in entry)) return false;
+  if (hasStatus && (typeof entry.status !== "string" || entry.status === "" || typeof entry.sinceSeconds !== "number")) {
+    return false;
+  }
+  if ("cwd" in entry && typeof entry.cwd !== "string") return false;
+  return "context" in entry && isContextField(entry.context);
+}
+
+function isStatusPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  return Array.isArray(payload.terminals) && payload.terminals.every((e) => isTerminalEntry(e));
+}
+
+async function runStatus(state) {
+  // Deliberately unvalidated: a bad value fails the fetch and is reported with
+  // the port in the message, which is the diagnosis.
+  const port = process.env.PI_LINK_PORT ?? 9900;
+  // One deadline covers the whole exchange, headers and body alike, so it has to
+  // be readable afterwards to tell a timeout from a malformed answer.
+  const deadline = AbortSignal.timeout(2000);
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${port}/status`, { signal: deadline });
+  } catch {
+    // Refused, unreachable or timed out: no hub is answering at this instant.
+    failNoHub(port);
+  }
+
+  if (!response.ok) failUnsupported();
+
+  let body;
+  try {
+    body = await response.text();
+  } catch {
+    // A listener that sends headers and then stalls is still an unanswered
+    // query, not an old hub: every timeout reports as "no hub".
+    if (deadline.aborted) failNoHub(port);
+    failUnsupported();
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    failUnsupported();
+  }
+  if (!isStatusPayload(payload)) failUnsupported();
+
+  if (state.json) {
+    process.stdout.write(body);
+    return;
+  }
+
+  console.log(
+    renderTable(payload.terminals, [
+      { header: "NAME", get: (e) => e.name },
+      { header: "STATUS", get: (e) => formatTerminalStatus(e) },
+      { header: "CONTEXT", get: (e) => formatContext(e.context) },
+      { header: "CWD", get: (e) => (e.cwd ? displayPath(e.cwd) : UNKNOWN), dim: true },
+    ]),
+  );
+}
+
 async function runResolve(state) {
   const name = state.resolveName; // already normalized
   const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const { local, all } = await findSessionsByName(name, dir, isCustom);
-  const matches = state.global ? all : local;
+  const matches = await findSessionsByName(name, dir, isCustom, localScope(state));
   if (matches.length === 1) {
     process.stdout.write(matches[0].path);
     return; // exit 0
@@ -523,18 +719,17 @@ async function runResolve(state) {
     printCandidates(name, matches); // exits 1
   }
   // matches.length === 0 → not found; exit 2 to distinguish from ambiguous.
+  // A local scan never reads names from other cwds, so the advice is offered
+  // without claiming anything is there.
   console.error(`No session named "${name}" found${state.global ? "" : " in this cwd"}.`);
-  if (!state.global && all.length > 0) {
-    console.error(`(${all.length} match${all.length === 1 ? "" : "es"} in other cwds — try --global to consider ${all.length === 1 ? "it" : "them"}.)`);
-  }
+  if (!state.global) console.error("Use --global to search other cwds.");
   process.exit(2);
 }
 
 async function runLauncher(state) {
   const name = state.launcherName; // already normalized
   const { dir, isCustom } = resolveSessionDir(process.cwd(), resolveAgentDir());
-  const { local, all } = await findSessionsByName(name, dir, isCustom);
-  const matches = state.global ? all : local;
+  const matches = await findSessionsByName(name, dir, isCustom, localScope(state));
   if (matches.length > 1) {
     printCandidates(name, matches);
   }
@@ -544,9 +739,8 @@ async function runLauncher(state) {
     console.error(`Resuming session: ${matches[0].path}`);
     piArgs.push("--session", matches[0].path);
   } else {
-    if (!state.global && all.length > local.length) {
-      const elsewhere = all.length - local.length;
-      console.error(`No "${name}" in this cwd. (${elsewhere} match${elsewhere === 1 ? "" : "es"} in other cwds — use --global to consider ${elsewhere === 1 ? "it" : "them"}.)`);
+    if (!state.global) {
+      console.error(`No "${name}" found in this cwd. Use --global to search other cwds.`);
     }
     console.error("Starting new session.");
   }

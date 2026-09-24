@@ -6,33 +6,47 @@
  * First terminal to connect becomes the hub; others join as clients.
  * Hub loss triggers automatic promotion of a surviving client.
  *
- * Tools: link_send, link_prompt, link_list, link_compact
- * Commands: /link, /link-name, /link-broadcast, /link-connect, /link-disconnect
+ * Tools: link_send, link_list, link_compact
+ * Commands: /link, /link-name, /link-connect, /link-disconnect
  */
 
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  VERSION as PI_VERSION,
+  keyHint,
+  keyText,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Box, Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import * as crypto from "node:crypto";
+import { createServer, type Server as HttpServer } from "node:http";
 import * as os from "node:os";
 
 import { WebSocket, WebSocketServer } from "ws";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
+// Pi 0.84.2 is the floor: `agent_settled` and `ctx.isIdle()` are the whole basis of
+// the settled lifecycle and the remote-compaction guard below, and there is one code
+// path for them. Package installation does not check the host version, so an older
+// Pi installs pi-link successfully and must be refused at load.
+const MIN_PI_VERSION = [0, 84, 2];
+
 const DEFAULT_PORT = 9900;
-const PROMPT_INACTIVITY_MS = 90_000;
-const PROMPT_HARD_CEILING_MS = 1_800_000;
-const COMPACT_TIMEOUT_MS = 180_000;
+const COMPACT_TIMEOUT_MS = 300_000;
 const RECONNECT_DELAY_MS = 2000;
-const KEEPALIVE_INTERVAL_MS = 30_000;
+// Bounds the HTTP Upgrade only. Without it `ws` waits forever, so a listener that
+// accepts the socket and never answers leaves the terminal offline with no retry.
+const CONNECT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const FLUSH_DELAY_MS = 200;
-const IDLE_RETRY_MS = 500;
 const BATCH_MAX_ITEMS = 20;
 const BATCH_MAX_CHARS = 16_000;
+// Visual rows of an incoming message kept while Pi's global expansion is off.
+const PREVIEW_ROWS = 6;
+// Consumed by harnesses that hide extension tools by default (Oh My Pi);
+// ignored by Pi, whose ToolDefinition has no such field.
+const TOP_LEVEL_TOOL = { loadMode: "essential" } as const;
 
 // ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -67,29 +81,13 @@ interface ChatMsg {
   from: string;
   to: string;
   content: string;
-  triggerTurn: boolean;
-}
-interface PromptRequestMsg {
-  type: "prompt_request";
-  id: string;
-  from: string;
-  to: string;
-  prompt: string;
-}
-interface PromptResponseMsg {
-  type: "prompt_response";
-  id: string;
-  from: string;
-  to: string;
-  response: string;
-  error?: string;
 }
 interface StatusUpdateMsg {
   type: "status_update";
   name: string;
   status: LinkStatus;
-  // Per-terminal LLM context. Absent = old terminal (ignore); null = clear
-  // stored value; object = store. Only status_update carries the null-clear.
+  // Per-terminal LLM context. Absent = keep the stored value; null = clear it;
+  // object = store it. Only status_update carries the null-clear.
   context?: ContextSnapshot | null;
 }
 interface ErrorMsg {
@@ -115,6 +113,7 @@ interface CompactResponseMsg {
 type LinkStatus =
   | { kind: "idle"; since: number }
   | { kind: "thinking"; since: number }
+  | { kind: "compacting"; since: number }
   | { kind: "tool"; toolName: string; since: number };
 
 type ContextSnapshot = { tokens: number | null; contextWindow: number };
@@ -125,16 +124,82 @@ type LinkMessage =
   | TerminalJoinedMsg
   | TerminalLeftMsg
   | ChatMsg
-  | PromptRequestMsg
-  | PromptResponseMsg
   | StatusUpdateMsg
   | ErrorMsg
   | CompactRequestMsg
   | CompactResponseMsg;
 
+/**
+ * True when Pi is at or above MIN_PI_VERSION. Stable releases only: a version
+ * carrying a prerelease or build suffix is refused, not guessed at, which leaves an
+ * ordered compare of three numbers as the whole rule.
+ */
+function piVersionSupported(version: string): boolean {
+  const parsed = /^(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
+  if (!parsed) return false;
+  for (let i = 0; i < 3; i++) {
+    const part = Number(parsed[i + 1]);
+    if (part !== MIN_PI_VERSION[i]) return part > MIN_PI_VERSION[i];
+  }
+  return true; // exactly the floor
+}
+
+// keyText is empty when app.tools.expand has no binding, and the native hint would then
+// read " to expand" with no key in it, naming nothing the reader can press.
+function expansionHint(dim: (text: string) => string): string {
+  return keyText("app.tools.expand")
+    ? keyHint("app.tools.expand", "to expand")
+    : dim("bind app.tools.expand to expand");
+}
+
+/**
+ * The first PREVIEW_ROWS rows of `content`, plus a hint when rows were dropped.
+ *
+ * The rows come from rendering `content` at the real width, not from splitting the
+ * raw string on newlines: one long logical line wraps into many visual rows, and
+ * the same message yields different rows in a narrow window. Rendering is Text's
+ * job here, cached by (text, width), so the preview stays a slice of the identical
+ * output the expanded view shows.
+ */
+function messagePreview(
+  content: Text,
+  dim: (text: string) => string,
+): Component {
+  const hint = new Text("", 0, 0);
+  return {
+    render(width: number): string[] {
+      const rows = content.render(width);
+      if (rows.length <= PREVIEW_ROWS) return rows;
+      // Rebuilt every render so a rebound key is never shown stale; it is one short
+      // line, and Text still caches the content rows, which are the expensive part.
+      hint.setText(
+        dim(`... (${rows.length - PREVIEW_ROWS} more lines, `) +
+          expansionHint(dim) +
+          dim(")"),
+      );
+      // The budget covers content only, so the hint may wrap rather than be cut off.
+      return [...rows.slice(0, PREVIEW_ROWS), ...hint.render(width)];
+    },
+    invalidate(): void {
+      content.invalidate();
+      hint.invalidate();
+    },
+  };
+}
+
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // First statement, so an unsupported host leaves behind no flag, event, tool,
+  // command, timer or socket to half-run with. Pi reports a factory that throws as an
+  // extension load error naming this message, and keeps running without pi-link.
+  if (!piVersionSupported(PI_VERSION)) {
+    throw new Error(
+      `pi-link requires Pi >=${MIN_PI_VERSION.join(".")} in x.y.z format, without suffixes ` +
+        `(detected ${PI_VERSION || "unknown"}); pi-link 0.2.x supports Pi 0.74–0.84.1.`,
+    );
+  }
+
   pi.registerFlag("link", {
     description: "Connect to link on startup",
     type: "boolean",
@@ -163,12 +228,17 @@ export default function (pi: ExtensionAPI) {
   let startupConnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Status tracking (local truth)
-  let agentRunning = false;
+  let agentRunning = false; // agent_start until agent_settled, not until agent_end
   let compactRunning = false; // true while compacting for a remote request
-  let activeToolName: string | null = null;
+  let localCompacting = false; // true while compacting for a human /compact
+  let compactDeadline: ReturnType<typeof setTimeout> | undefined;
+  let wasCompactionGated = false; // gate state syncCompactionStatus() last acted on
+  // toolCallId → toolName. Pi runs tools in parallel by default and both tool
+  // events carry the call id, so one slot per call is the only way an end can clear
+  // the call it belongs to. Insertion-ordered, which is what picks the display.
+  const activeTools = new Map<string, string>();
   let stateSince = Date.now();
-  let lastPushedKind: string | null = null;
-  let lastPushedTool: string | null = null;
+  let lastPushedStatus: string | null = null; // identity of the last published status
   const terminalStatuses = new Map<string, LinkStatus>(); // other terminals
   const terminalContexts = new Map<string, ContextSnapshot>(); // other terminals' context
   let currentCwd = "";
@@ -176,27 +246,26 @@ export default function (pi: ExtensionAPI) {
 
   // Hub state
   let wss: WebSocketServer | null = null;
+  // The hub owns the HTTP server the WS server rides on, because `wss.close()`
+  // never closes a server it was handed. Nulled wherever `wss` is.
+  let hubHttpServer: HttpServer | null = null;
   const hubClients = new Map<WebSocket, string>(); // ws → terminal name
-  const hubTerminalStatuses = new Map<string, LinkStatus>(); // hub-authoritative
-  const hubTerminalContexts = new Map<string, ContextSnapshot>(); // hub-authoritative
-  const hubTerminalCwds = new Map<string, string>(); // hub-authoritative (excludes self)
 
   // Client state
   let ws: WebSocket | null = null;
 
-  // Pending prompt responses (sender waiting for remote answer)
-  const pendingPromptResponses = new Map<
-    string,
-    {
-      resolve: (result: {
-        content: { type: "text"; text: string }[];
-        details: Record<string, unknown>;
-      }) => void;
-      targetName: string;
-      inactivityTimeout: ReturnType<typeof setTimeout>;
-      ceilingTimeout: ReturnType<typeof setTimeout>;
-    }
-  >();
+  // Establishment. One attempt owns every pending transport across the whole
+  // client-then-hub sequence, because a transport can emit callbacks from
+  // construction onward while `ws`/`wss` are still empty. The record itself is the
+  // generation token: a callback that captured it can tell whether it is still the
+  // current owner by identity alone, and cancellation has handles to close.
+  type ConnectionAttempt = {
+    promise: Promise<void>;
+    socket: WebSocket | null; // dialing, not yet `ws`
+    server: WebSocketServer | null; // binding, not yet `wss`
+    httpServer: HttpServer | null; // binding, not yet `hubHttpServer`
+  };
+  let connectionAttempt: ConnectionAttempt | null = null;
 
   // Pending compact responses (sender waiting for remote compaction to finish)
   const pendingCompactResponses = new Map<
@@ -211,11 +280,7 @@ export default function (pi: ExtensionAPI) {
     }
   >();
 
-  // Pending remote prompt (this terminal is executing a prompt for someone else)
-  let pendingRemotePrompt: { id: string; from: string } | null = null;
-  let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
-
-  // Inbox: idle-gated batched delivery for triggerTurn:true messages
+  // Inbox: fixed-window batching; every batch is delivered to the receiver's model
   const inbox: { from: string; content: string }[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -242,7 +307,7 @@ export default function (pi: ExtensionAPI) {
     const ui = getUi();
     if (!ui) return;
     const theme = ui.theme;
-    const count = connectedTerminals.length;
+    const count = visibleTerminals().length;
     const info =
       role === "disconnected"
         ? "link: offline"
@@ -251,15 +316,47 @@ export default function (pi: ExtensionAPI) {
   }
 
   function deriveStatus(): LinkStatus {
-    if (activeToolName)
-      return { kind: "tool", toolName: activeToolName, since: stateSince };
+    // Highest precedence, so that reporting "compacting" and deferring delivery are
+    // the same condition rather than two that can disagree. In reachable states it
+    // competes only with "idle" — a compaction runs with no tool and no agent run —
+    // but where it could overlap, the gate is the more actionable fact: work sent
+    // here waits, and link_compact declines.
+    if (compactionGated()) return { kind: "compacting", since: stateSince };
+    const tool = displayedTool();
+    if (tool) return { kind: "tool", toolName: tool, since: stateSince };
     if (agentRunning) return { kind: "thinking", since: stateSince };
     return { kind: "idle", since: stateSince };
   }
 
+  /**
+   * The tool a peer is shown while several run at once: the first still active, by
+   * start order. A later start never displaces it, so parallel work does not churn
+   * the status; when it ends the next one takes over.
+   */
+  function displayedTool(): string | null {
+    for (const name of activeTools.values()) return name;
+    return null;
+  }
+
+  /**
+   * The single definition of "the same status": what a peer sees, as one comparable
+   * value. Both users of that question go through here — pushStatus() dedupes on it,
+   * and every handler compares it before and after mutating to decide whether
+   * stateSince moves. One function, so the clock and the wire cannot come to
+   * disagree about what changed; restarting the clock on a change nobody can see
+   * would publish nothing now and make the next push carry a duration nobody
+   * observed. Two calls of the same tool handing over are one status by this rule.
+   *
+   * The two forms cannot collide: every non-tool kind is a fixed literal from the
+   * LinkStatus union with no colon in it, and the tool form is always prefixed, so
+   * no toolName can spell a kind.
+   */
+  function statusIdentity(s: LinkStatus): string {
+    return s.kind === "tool" ? `tool:${s.toolName}` : s.kind;
+  }
+
   function captureContext(): ContextSnapshot | undefined {
     if (!ctx) return undefined;
-    if (typeof ctx.getContextUsage !== "function") return undefined; // older Pi
     const usage = ctx.getContextUsage();
     if (!usage) return undefined;
     if (usage.contextWindow <= 0) return undefined; // no real context to report
@@ -269,12 +366,9 @@ export default function (pi: ExtensionAPI) {
   function pushStatus(force = false) {
     if (role === "disconnected") return;
     const status = deriveStatus();
-    const newKind = status.kind;
-    const newTool = status.kind === "tool" ? status.toolName : null;
-    if (!force && newKind === lastPushedKind && newTool === lastPushedTool)
-      return;
-    lastPushedKind = newKind;
-    lastPushedTool = newTool;
+    const identity = statusIdentity(status);
+    if (!force && identity === lastPushedStatus) return;
+    lastPushedStatus = identity;
     const context = captureContext(); // only when we actually push
     const msg: StatusUpdateMsg = {
       type: "status_update",
@@ -294,6 +388,12 @@ export default function (pi: ExtensionAPI) {
   function normalizeName(name: string | undefined | null): string | undefined {
     const n = name?.trim().replace(/\s+/g, " ");
     return n ? n : undefined;
+  }
+
+  // Group by name convention: everything after the first `@`; plain names are group "".
+  function groupOf(name: string): string {
+    const at = name.indexOf("@");
+    return at === -1 ? "" : name.slice(at + 1);
   }
 
   // Latest custom session entry of a given type (last-write-wins), or undefined.
@@ -333,7 +433,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function formatContext(c: ContextSnapshot | null | undefined): string {
-    if (!c || c.contextWindow <= 0) return ""; // guard against bad wire data
+    if (!c) return "";
     const window = formatTokens(c.contextWindow);
     if (c.tokens === null) return `?/${window}`;
     const percent = Math.round((c.tokens / c.contextWindow) * 100);
@@ -342,19 +442,16 @@ export default function (pi: ExtensionAPI) {
 
   function getStatusFor(name: string): LinkStatus | null {
     if (name === terminalName) return deriveStatus();
-    const map = role === "hub" ? hubTerminalStatuses : terminalStatuses;
-    return map.get(name) ?? null;
+    return terminalStatuses.get(name) ?? null;
   }
 
   function getCwdFor(name: string): string | null {
     if (name === terminalName) return currentCwd || null;
-    if (role === "hub") return hubTerminalCwds.get(name) ?? null;
     return terminalCwds.get(name) ?? null;
   }
 
   function getContextFor(name: string): ContextSnapshot | null {
     if (name === terminalName) return captureContext() ?? null;
-    if (role === "hub") return hubTerminalContexts.get(name) ?? null;
     return terminalContexts.get(name) ?? null;
   }
 
@@ -373,14 +470,18 @@ export default function (pi: ExtensionAPI) {
     if (startupConnectTimer) clearTimeout(startupConnectTimer);
     startupConnectTimer = setTimeout(() => {
       startupConnectTimer = null;
-      if (!disposed && ctx) initialize();
+      if (!disposed && ctx) void initialize();
     }, 0);
   }
 
-  // ── Inbox: idle-gated batched delivery ───────────────────────────────────
+  // ── Inbox: batched delivery ──────────────────────────────────────────────
 
+  // The first queued message opens the window and later arrivals join it, so the
+  // deadline belongs to the message that started it. Rearming here instead would
+  // make the window trailing-edge, and a stream whose gaps stay under the delay
+  // could postpone delivery for as long as it kept arriving.
   function scheduleFlush(delay: number) {
-    if (flushTimer) clearTimeout(flushTimer);
+    if (flushTimer) return;
     flushTimer = setTimeout(flushInbox, delay);
   }
 
@@ -389,18 +490,10 @@ export default function (pi: ExtensionAPI) {
     if (inbox.length === 0) return;
     if (!ctx) return;
 
-    // Only deliver when idle so triggerTurn takes the prompt-start path
-    // instead of mid-run steering, avoiding async delivery loss.
-    let idle: boolean;
-    try {
-      idle = ctx.isIdle();
-    } catch {
-      return; // stale context — bail without retry
-    }
-    if (!idle) {
-      scheduleFlush(IDLE_RETRY_MS);
-      return;
-    }
+    // Compacting: hold everything and return WITHOUT rescheduling. setCompacting()
+    // drains on release, so polling a compaction that may run to the 300s ceiling
+    // would be ~1500 wakeups for no information.
+    if (compactionGated()) return;
 
     // Select batch: up to BATCH_MAX_ITEMS, ~BATCH_MAX_CHARS total (soft cap —
     // first item always included even if oversized, others deferred to next flush)
@@ -425,10 +518,87 @@ export default function (pi: ExtensionAPI) {
     );
     inbox.splice(0, batch.length);
 
-    // Reschedule if inbox still has items; agent_end wakeup will usually beat this
+    // Items held back by the batch caps go out in the next window
     if (inbox.length > 0) {
-      scheduleFlush(IDLE_RETRY_MS);
+      scheduleFlush(FLUSH_DELAY_MS);
     }
+  }
+
+  /**
+   * True exactly while delivery is deferred. Also what the terminal reports as its
+   * status, so availability and delivery cannot disagree.
+   *
+   * The two flags are not duplication. compactRunning is set synchronously by the
+   * compact_request handler before it calls ctx.compact(), covering the window
+   * before session_before_compact arrives; localCompacting covers a human /compact,
+   * which pi-link never initiates.
+   *
+   * Both are load-bearing because Pi will not save us here: AgentSession.prompt()
+   * refuses to run during compaction, but sendCustomMessage reaches _runAgentPrompt
+   * directly and is not covered by that guard.
+   */
+  function compactionGated() {
+    return localCompacting || compactRunning;
+  }
+
+  /**
+   * Record a compaction gate transition. Call after any change to either flag.
+   *
+   * wasCompactionGated tracks the gate itself, deliberately NOT lastPushedStatus: the
+   * two diverge exactly while disconnected, when pushStatus() returns before
+   * recording anything, and a gate that opened and closed unseen would then leave
+   * stateSince stranded at the moment compaction began. Entering and leaving are one
+   * transition each, so the two flag moves of a remote compaction report once.
+   *
+   * The local record is updated whether or not publication is possible; pushStatus()
+   * decides that separately.
+   */
+  function syncCompactionStatus() {
+    const gated = compactionGated();
+    if (gated === wasCompactionGated) return;
+    wasCompactionGated = gated;
+    stateSince = Date.now(); // the duration shown is of the compaction, not what preceded it
+    pushStatus();
+  }
+
+  /**
+   * Drain the inbox once NO gate remains. Call after clearing either flag.
+   *
+   * Both gates must be checked together, because a remote compact sets both:
+   * ctx.compact() reaches Pi's compact(), which reports reason "manual", so
+   * session_before_compact sets localCompacting on top of compactRunning. Pi emits
+   * session_compact strictly before it resolves and fires onComplete, so releasing
+   * on either flag alone can arm a flush that finds the other flag still standing,
+   * returns without rescheduling, and strands the inbox with no release left.
+   */
+  function releaseInbox() {
+    if (!localCompacting && !compactRunning && inbox.length > 0) {
+      scheduleFlush(FLUSH_DELAY_MS);
+    }
+  }
+
+  /**
+   * Gate and release inbox delivery around a local manual compaction.
+   *
+   * The deadline is the only backstop pi-link uses. Pi 0.84.3+ reports failure and
+   * abort through `session_compact_failed`, which pi-link does not handle (see
+   * REPORT-session-compact-failed.md); `session_compact` is the only
+   * compaction-ending event it handles. The timer handle must be explicit
+   * and cleared on every transition: a bare setTimeout outlives its own
+   * compaction and would release a *later* compaction's flag.
+   *
+   * COMPACT_TIMEOUT_MS also bounds the remote-request wait. The two share a
+   * value, not a meaning: nothing here depends on their being equal.
+   */
+  function setCompacting(on: boolean) {
+    localCompacting = on;
+    clearTimeout(compactDeadline);
+    compactDeadline = on
+      ? setTimeout(() => setCompacting(false), COMPACT_TIMEOUT_MS)
+      : undefined;
+    // Release drains; it never polls. Nothing else wakes a waiting inbox.
+    if (!on) releaseInbox();
+    syncCompactionStatus();
   }
 
   // ── Connection intent ──────────────────────────────────────────────────
@@ -441,16 +611,7 @@ export default function (pi: ExtensionAPI) {
     return pi.getFlag("link") === true;
   }
 
-  // ── Pending prompt helpers ───────────────────────────────────────────────
-
-  function cleanupPending(requestId: string) {
-    const pending = pendingPromptResponses.get(requestId);
-    if (!pending) return null;
-    clearTimeout(pending.inactivityTimeout);
-    clearTimeout(pending.ceilingTimeout);
-    pendingPromptResponses.delete(requestId);
-    return pending;
-  }
+  // ── Pending compact helpers ──────────────────────────────────────────────
 
   function cleanupPendingCompact(requestId: string) {
     const pending = pendingCompactResponses.get(requestId);
@@ -458,29 +619,6 @@ export default function (pi: ExtensionAPI) {
     clearTimeout(pending.timeout);
     pendingCompactResponses.delete(requestId);
     return pending;
-  }
-
-  function makeInactivityTimeout(requestId: string, targetName: string) {
-    return setTimeout(() => {
-      const pending = cleanupPending(requestId);
-      if (pending) {
-        pending.resolve(
-          textResult(
-            `Prompt to "${targetName}" timed out (no activity for ${PROMPT_INACTIVITY_MS / 1000}s)`,
-            { to: targetName, error: "timeout" },
-          ),
-        );
-      }
-    }, PROMPT_INACTIVITY_MS);
-  }
-
-  function resetInactivityFor(targetName: string) {
-    for (const [id, pending] of pendingPromptResponses) {
-      if (pending.targetName === targetName) {
-        clearTimeout(pending.inactivityTimeout);
-        pending.inactivityTimeout = makeInactivityTimeout(id, targetName);
-      }
-    }
   }
 
   function allTerminalNames(): Set<string> {
@@ -493,13 +631,64 @@ export default function (pi: ExtensionAPI) {
   function uniqueName(requested: string): string {
     const existing = allTerminalNames();
     if (!existing.has(requested)) return requested;
+    // Suffix the local part so a collision never changes the group (same boundary as groupOf).
+    const at = requested.indexOf("@");
+    const cut = at === -1 ? requested.length : at;
+    const local = requested.slice(0, cut);
+    const tail = requested.slice(cut);
     let i = 2;
-    while (existing.has(`${requested}-${i}`)) i++;
-    return `${requested}-${i}`;
+    while (existing.has(`${local}-${i}${tail}`)) i++;
+    return `${local}-${i}${tail}`;
   }
 
   function terminalList(): string[] {
     return Array.from(allTerminalNames()).sort();
+  }
+
+  /**
+   * Hub: the `GET /status` snapshot. Pure reads — it mutates nothing and sends
+   * nothing, so observing the link cannot disturb it.
+   *
+   * Hub entry first, then clients sorted by name, so pollers see a stable order.
+   * `status`/`sinceSeconds` and `cwd` are omitted rather than invented when the
+   * hub has not heard them yet: a client is in `hubClients` from `register`, but
+   * its first `status_update` arrives a round trip later, and reporting a fresh
+   * peer as "idle" would be exactly the false inventory this endpoint exists to
+   * remove.
+   */
+  function buildStatusPayload() {
+    const now = Date.now();
+
+    const describe = (name: string, entryRole: "hub" | "client") => {
+      const status = getStatusFor(name);
+      const cwd = getCwdFor(name);
+      const context = getContextFor(name);
+      return {
+        name,
+        role: entryRole,
+        ...(status
+          ? {
+              status: statusIdentity(status),
+              sinceSeconds: Math.round((now - status.since) / 1000),
+            }
+          : {}),
+        ...(cwd ? { cwd } : {}),
+        context: context
+          ? { tokens: context.tokens, window: context.contextWindow }
+          : null,
+      };
+    };
+
+    return {
+      hub: terminalName,
+      port: DEFAULT_PORT,
+      terminals: [
+        describe(terminalName, "hub"),
+        ...Array.from(hubClients.values())
+          .sort()
+          .map((name) => describe(name, "client")),
+      ],
+    };
   }
 
   function safeParse(data: string): LinkMessage | null {
@@ -518,7 +707,6 @@ export default function (pi: ExtensionAPI) {
     for (const [clientWs, name] of hubClients) {
       if (name !== excludeName) clientWs.send(json);
     }
-    // Also deliver to the hub itself (unless excluded)
     if (excludeName !== terminalName) handleIncoming(msg);
   }
 
@@ -537,23 +725,17 @@ export default function (pi: ExtensionAPI) {
    * still reject via protocol-level error responses).
    */
   function routeMessage(
-    msg:
-      | ChatMsg
-      | PromptRequestMsg
-      | PromptResponseMsg
-      | CompactRequestMsg
-      | CompactResponseMsg,
+    msg: ChatMsg | CompactRequestMsg | CompactResponseMsg,
   ): boolean {
     if (role === "hub") {
-      if (msg.to === "*") {
-        hubBroadcast(msg, msg.from);
-        return true;
-      }
-      if (msg.to === terminalName) {
+      // Isolation is a property of the link: a target in another group does not
+      // exist from the sender's domain, for every type routeMessage carries.
+      const crossGroup = groupOf(msg.from) !== groupOf(msg.to);
+      if (!crossGroup && msg.to === terminalName) {
         handleIncoming(msg);
         return true;
       }
-      const targetWs = hubClientByName(msg.to);
+      const targetWs = crossGroup ? undefined : hubClientByName(msg.to);
       if (targetWs) {
         targetWs.send(JSON.stringify(msg));
         return true;
@@ -561,35 +743,22 @@ export default function (pi: ExtensionAPI) {
       // Target not found — send error back to sender
       const errText = `Terminal "${msg.to}" not found`;
       const errorMsg: LinkMessage =
-        msg.type === "prompt_request"
+        msg.type === "compact_request"
           ? {
-              type: "prompt_response",
+              type: "compact_response",
               id: msg.id,
               from: terminalName,
               to: msg.from,
-              response: "",
-              error: errText,
+              ok: false,
+              reason: "not_found",
             }
-          : msg.type === "compact_request"
-            ? {
-                type: "compact_response",
-                id: msg.id,
-                from: terminalName,
-                to: msg.from,
-                ok: false,
-                reason: "not_found",
-              }
-            : { type: "error", message: errText };
+          : { type: "error", message: errText };
 
       if (msg.from === terminalName) {
-        // For prompt_request/compact_request, deliver the error response
-        // locally so the matching pending map resolves. For chat, skip — the
-        // tool result (via return false) is sufficient; no extra UI toast.
-        if (
-          errorMsg.type === "prompt_response" ||
-          errorMsg.type === "compact_response"
-        )
-          handleIncoming(errorMsg);
+        // For compact_request, deliver the error response locally so the
+        // matching pending map resolves. For chat, skip — the tool result
+        // (via return false) is sufficient; no extra UI toast.
+        if (errorMsg.type === "compact_response") handleIncoming(errorMsg);
       } else {
         hubClientByName(msg.from)?.send(JSON.stringify(errorMsg));
       }
@@ -631,7 +800,7 @@ export default function (pi: ExtensionAPI) {
         }
         updateStatus();
         notify(
-          `Joined link as "${terminalName}" (${connectedTerminals.length} online)`,
+          `Joined link as "${terminalName}" (${visibleTerminals().length} online)`,
           "info",
         );
         pushStatus(true);
@@ -640,49 +809,33 @@ export default function (pi: ExtensionAPI) {
       // ── Membership updates ──
       case "terminal_joined":
         connectedTerminals = msg.terminals;
-        if (role !== "hub" && msg.cwd) terminalCwds.set(msg.name, msg.cwd);
-        if (role !== "hub" && msg.context)
-          terminalContexts.set(msg.name, msg.context);
+        if (msg.cwd) terminalCwds.set(msg.name, msg.cwd);
+        if (msg.context) terminalContexts.set(msg.name, msg.context);
         updateStatus();
-        notify(`"${msg.name}" joined the link`, "info");
+        if (groupOf(msg.name) === groupOf(terminalName))
+          notify(`"${msg.name}" joined the link`, "info");
         break;
 
       case "terminal_left":
         connectedTerminals = msg.terminals;
         terminalStatuses.delete(msg.name);
-        if (role !== "hub") {
-          terminalCwds.delete(msg.name);
-          terminalContexts.delete(msg.name);
-        }
-        // Fail any pending prompts/compacts to the departed terminal
-        for (const [id, pending] of pendingPromptResponses) {
-          if (pending.targetName === msg.name) {
-            const p = cleanupPending(id);
-            if (p) {
-              p.resolve(
-                textResult(`Terminal "${msg.name}" disconnected`, {
-                  to: msg.name,
-                  error: "disconnected",
-                }),
-              );
-            }
-          }
-        }
+        terminalCwds.delete(msg.name);
+        terminalContexts.delete(msg.name);
+        // Fail any pending compact request to the departed terminal
         for (const [id, pending] of pendingCompactResponses) {
           if (pending.targetName === msg.name) {
-            const p = cleanupPendingCompact(id);
-            if (p) {
-              p.resolve(
-                textResult(`Terminal "${msg.name}" disconnected`, {
-                  to: msg.name,
-                  error: "disconnected",
-                }),
-              );
-            }
+            cleanupPendingCompact(id);
+            pending.resolve(
+              textResult(`Terminal "${msg.name}" disconnected`, {
+                to: msg.name,
+                error: "disconnected",
+              }),
+            );
           }
         }
         updateStatus();
-        notify(`"${msg.name}" left the link`, "info");
+        if (groupOf(msg.name) === groupOf(terminalName))
+          notify(`"${msg.name}" left the link`, "info");
         break;
 
       // ── Status update from another terminal ──
@@ -690,46 +843,18 @@ export default function (pi: ExtensionAPI) {
         terminalStatuses.set(msg.name, msg.status);
         if (msg.context) terminalContexts.set(msg.name, msg.context);
         else if (msg.context === null) terminalContexts.delete(msg.name);
-        resetInactivityFor(msg.name);
         break;
 
       // ── Chat message ──
       case "chat":
-        if (msg.triggerTurn) {
-          inbox.push({ from: msg.from, content: msg.content });
-          scheduleFlush(FLUSH_DELAY_MS);
-        } else {
-          pi.sendMessage(
-            {
-              customType: "link",
-              content: msg.content,
-              display: true,
-              details: { from: msg.from },
-            },
-            { triggerTurn: false, deliverAs: "steer" },
-          );
-        }
+        inbox.push({ from: msg.from, content: msg.content });
+        scheduleFlush(FLUSH_DELAY_MS);
         break;
 
       // ── Another terminal asks us to compact our context ──
       case "compact_request": {
-        if (agentRunning || pendingRemotePrompt || compactRunning) {
-          routeMessage({
-            type: "compact_response",
-            id: msg.id,
-            from: terminalName,
-            to: msg.from,
-            ok: false,
-            reason: "busy",
-          });
-          break;
-        }
         const { id, from } = msg;
-        let finished = false;
-        const finish = (ok: boolean, reason?: string) => {
-          if (finished) return;
-          finished = true;
-          compactRunning = false;
+        const respond = (ok: boolean, reason?: string) =>
           routeMessage({
             type: "compact_response",
             id,
@@ -738,17 +863,43 @@ export default function (pi: ExtensionAPI) {
             ok,
             reason,
           });
-        };
-        if (!ctx?.compact) {
-          finish(false, "unsupported");
+        // Answered before the busy question, and not through finish(): no capability
+        // and no context are refusals of a request we never took on, so nothing here
+        // owns the gate to clear or the inbox to release.
+        if (!ctx || !ctx.compact) {
+          respond(false, "unsupported");
           break;
         }
+        // Pi's idle state is the authority on whether this terminal is working.
+        // agentRunning is not: Pi may still retry, run an automatic compaction, or
+        // drain a queued continuation inside a run whose agent_end already fired, and
+        // compact() would abort that work and compact the same branch a second time.
+        // compactionGated() adds what Pi's idle flag cannot cover — a manual
+        // compaction is not an agent run — and keeps declining while either gate
+        // stands, so we never touch a compaction we did not start.
+        if (!ctx.isIdle() || compactionGated()) {
+          respond(false, "busy");
+          break;
+        }
+        let finished = false;
+        const finish = (ok: boolean, reason?: string) => {
+          if (finished) return;
+          finished = true;
+          compactRunning = false;
+          releaseInbox(); // last gate may clear here, after session_compact already fired
+          // Only reverts status if localCompacting is also clear. A failure after
+          // session_before_compact leaves it standing, so the terminal truthfully
+          // keeps reporting compacting until the deadline or agent_start.
+          syncCompactionStatus();
+          respond(ok, reason);
+        };
         compactRunning = true;
+        syncCompactionStatus();
         notify(`"${from}" requested compact`, "info");
-        // compact() aborts the current turn first, so the busy guard above
-        // keeps us from interrupting active work. The runtime guarantees
-        // exactly one of onComplete/onError fires, so compactRunning can't
-        // get stuck and the sender won't hang.
+        // compact() aborts the current turn first, so the idle guard above
+        // keeps us from interrupting active work. Pi reports the compaction's
+        // outcome through these callbacks once compact() settles; finish() clears
+        // compactRunning and answers the request.
         try {
           ctx.compact({
             customInstructions: msg.instructions,
@@ -762,58 +913,12 @@ export default function (pi: ExtensionAPI) {
         break;
       }
 
-      // ── Another terminal asks us to run a prompt ──
-      case "prompt_request":
-        if (agentRunning || pendingRemotePrompt || compactRunning) {
-          routeMessage({
-            type: "prompt_response",
-            id: msg.id,
-            from: terminalName,
-            to: msg.from,
-            response: "",
-            error: "Terminal is busy",
-          });
-        } else {
-          pendingRemotePrompt = { id: msg.id, from: msg.from };
-          // Keepalive: periodic status push so sender knows we're alive.
-          // Keepalive presumes sendUserMessage() starts a run (platform contract);
-          // if it ever doesn't, the sender's 30 min hard ceiling is the backstop.
-          if (keepaliveTimer) clearInterval(keepaliveTimer);
-          keepaliveTimer = setInterval(
-            () => pushStatus(true),
-            KEEPALIVE_INTERVAL_MS,
-          );
-          notify(`Running remote prompt from "${msg.from}"`, "info");
-          pi.sendUserMessage(
-            `[Remote prompt from "${msg.from}"]\n\n${msg.prompt}`,
-          );
-        }
-        break;
-
-      // ── Response to a prompt we sent ──
-      case "prompt_response": {
-        const pending = cleanupPending(msg.id);
-        if (pending) {
-          if (msg.error) {
-            pending.resolve(
-              textResult(`Error from "${msg.from}": ${msg.error}`, {
-                from: msg.from,
-                error: msg.error,
-              }),
-            );
-          } else {
-            pending.resolve(textResult(msg.response, { from: msg.from }));
-          }
-        }
-        break;
-      }
-
       // ── Response to a compact we requested ──
       case "compact_response": {
         const pending = cleanupPendingCompact(msg.id);
         if (pending) {
           // Use the requested target, not msg.from: a hub-synthesized
-          // not_found response comes from the hub, not the worker.
+          // not_found response comes from the hub, not the target.
           const target = pending.targetName;
           if (msg.ok) {
             pending.resolve(
@@ -852,30 +957,23 @@ export default function (pi: ExtensionAPI) {
       if (msg.type === "register") {
         if (clientName) return; // already registered — ignore duplicate
         clientName = uniqueName(msg.name);
+        // The socket must be in hubClients before terminalList(), or the newcomer
+        // is missing from its own roster. Its metadata is deliberately not stored
+        // yet: the maps below must not echo the newcomer's own snapshot back to it.
         hubClients.set(clientWs, clientName);
-        if (msg.cwd) hubTerminalCwds.set(clientName, msg.cwd);
-        if (msg.context) hubTerminalContexts.set(clientName, msg.context);
         const list = terminalList();
-        connectedTerminals = list;
-        updateStatus();
 
-        // Confirm to the new client (include status + cwd snapshots)
+        // Confirm to the new client (with status, cwd and context snapshots)
         const statuses: Record<string, LinkStatus> = {};
         statuses[terminalName] = deriveStatus(); // hub's own status
-        for (const [name, status] of hubTerminalStatuses) {
-          if (name !== clientName) statuses[name] = status;
-        }
+        for (const [name, status] of terminalStatuses) statuses[name] = status;
         const cwds: Record<string, string> = {};
         if (currentCwd) cwds[terminalName] = currentCwd; // hub's own cwd
-        for (const [name, cwd] of hubTerminalCwds) {
-          if (name !== clientName) cwds[name] = cwd;
-        }
+        for (const [name, cwd] of terminalCwds) cwds[name] = cwd;
         const contexts: Record<string, ContextSnapshot> = {};
         const hubContext = captureContext();
         if (hubContext) contexts[terminalName] = hubContext; // hub's own context
-        for (const [name, c] of hubTerminalContexts) {
-          if (name !== clientName) contexts[name] = c;
-        }
+        for (const [name, c] of terminalContexts) contexts[name] = c;
         clientWs.send(
           JSON.stringify({
             type: "welcome",
@@ -887,7 +985,8 @@ export default function (pi: ExtensionAPI) {
           } satisfies WelcomeMsg),
         );
 
-        // Notify everyone else (include joiner's cwd + context)
+        // Notify everyone else (include joiner's cwd + context). The hub's own
+        // self-delivery is what records the newcomer's metadata and roster.
         const joined: TerminalJoinedMsg = {
           type: "terminal_joined",
           name: clientName,
@@ -904,10 +1003,9 @@ export default function (pi: ExtensionAPI) {
 
       // Status update — store and fan out to other clients only (not back to hub)
       if (msg.type === "status_update") {
-        hubTerminalStatuses.set(clientName, msg.status);
-        if (msg.context) hubTerminalContexts.set(clientName, msg.context);
-        else if (msg.context === null) hubTerminalContexts.delete(clientName);
-        resetInactivityFor(clientName);
+        terminalStatuses.set(clientName, msg.status);
+        if (msg.context) terminalContexts.set(clientName, msg.context);
+        else if (msg.context === null) terminalContexts.delete(clientName);
         const normalized: StatusUpdateMsg = {
           type: "status_update",
           name: clientName,
@@ -921,13 +1019,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Route chat / prompt messages.
+      // Route chat and compact messages.
       // Normalize `from` to the hub's authoritative socket→name mapping,
       // mirroring the status_update path above. Don't trust the client.
       if (
         msg.type === "chat" ||
-        msg.type === "prompt_request" ||
-        msg.type === "prompt_response" ||
         msg.type === "compact_request" ||
         msg.type === "compact_response"
       ) {
@@ -940,12 +1036,9 @@ export default function (pi: ExtensionAPI) {
       const name = hubClients.get(clientWs);
       if (!name) return; // already removed (e.g. via disconnect) — ignore stale event
       hubClients.delete(clientWs);
-      hubTerminalStatuses.delete(name);
-      hubTerminalContexts.delete(name);
-      hubTerminalCwds.delete(name);
       const list = terminalList();
-      connectedTerminals = list;
-      updateStatus();
+      // Self-delivery of this frame drops the departed terminal's metadata and
+      // refreshes the hub's own roster.
       const left: TerminalLeftMsg = {
         type: "terminal_left",
         name,
@@ -961,20 +1054,46 @@ export default function (pi: ExtensionAPI) {
 
   // ── Start as hub ─────────────────────────────────────────────────────────
 
-  function startHub(): Promise<boolean> {
+  function startHub(attempt: ConnectionAttempt): Promise<boolean> {
     return new Promise((resolve) => {
-      const server = new WebSocketServer({
-        port: DEFAULT_PORT,
-        host: "127.0.0.1",
+      // Owning the HTTP server is what makes `GET /status` possible: a port-bound
+      // `WebSocketServer` builds its own and answers every plain request with 426.
+      // `ws` forwards this server's `listening` and `error`, so the election below
+      // is unchanged.
+      const httpServer = createServer((req, res) => {
+        if (req.method === "GET" && req.url === "/status") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(buildStatusPayload()));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
       });
+      attempt.httpServer = httpServer;
+
+      const server = new WebSocketServer({ server: httpServer });
+      attempt.server = server;
+
+      // The phase settles once. `error` and a pre-listen `close` both report the
+      // same failure, and closing a cancelled server reports it a third time.
+      let settled = false;
+      const settle = (established: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (attempt.server === server) attempt.server = null;
+        if (attempt.httpServer === httpServer) attempt.httpServer = null;
+        resolve(established);
+      };
 
       server.on("listening", () => {
-        if (disposed) {
+        if (!attemptIsCurrent(attempt)) {
           server.close();
-          resolve(false);
+          httpServer.close();
+          settle(false);
           return;
         }
         wss = server;
+        hubHttpServer = httpServer;
         // If a client `/link-name` was in flight when the previous hub vanished,
         // this terminal is now establishing hub identity, so honor that pending
         // request. Otherwise keep the last hub-assigned identity — don't replay
@@ -988,11 +1107,13 @@ export default function (pi: ExtensionAPI) {
           `Link hub started on :${DEFAULT_PORT} as "${terminalName}"`,
           "info",
         );
-        resolve(true);
+        settle(true);
       });
 
       server.on("connection", (clientWs) => {
-        if (disposed) {
+        // Only the established hub may adopt a client. A cancelled listener can
+        // still receive one while it unwinds, and teardown clears both of these.
+        if (wss !== server || role !== "hub") {
           clientWs.close();
           return;
         }
@@ -1001,30 +1122,48 @@ export default function (pi: ExtensionAPI) {
 
       server.on("error", () => {
         // Port in use → someone else is the hub
-        resolve(false);
+        settle(false);
       });
+
+      server.on("close", () => {
+        // Reached when a pending server is cancelled; a no-op once established.
+        settle(false);
+      });
+
+      // Last, so no forwarded event can arrive before its handler exists.
+      httpServer.listen(DEFAULT_PORT, "127.0.0.1");
     });
   }
 
   // ── Connect as client ────────────────────────────────────────────────────
 
-  function connectAsClient(): Promise<boolean> {
+  function connectAsClient(attempt: ConnectionAttempt): Promise<boolean> {
     return new Promise((resolve) => {
-      const socket = new WebSocket(`ws://127.0.0.1:${DEFAULT_PORT}`);
-      let resolved = false;
+      const socket = new WebSocket(`ws://127.0.0.1:${DEFAULT_PORT}`, {
+        handshakeTimeout: CONNECT_HANDSHAKE_TIMEOUT_MS,
+      });
+      attempt.socket = socket;
+
+      // The phase settles once. A failed dial arrives as `error` then `close`, and
+      // ws reports a handshake timeout the same way, so both must be idempotent.
+      let settled = false;
+      const settle = (established: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (attempt.socket === socket) attempt.socket = null;
+        resolve(established);
+      };
 
       socket.on("open", () => {
-        if (disposed) {
+        if (!attemptIsCurrent(attempt)) {
           socket.close();
-          if (!resolved) {
-            resolved = true;
-            resolve(false);
-          }
+          settle(false);
           return;
         }
+        // Pending becomes established in one step, so no other code can observe a
+        // socket that is neither.
         ws = socket;
         role = "client";
-        resolved = true;
         // Register with preferred name if available, otherwise current name
         socket.send(
           JSON.stringify({
@@ -1034,35 +1173,39 @@ export default function (pi: ExtensionAPI) {
             context: captureContext(),
           } satisfies RegisterMsg),
         );
-        resolve(true);
+        settle(true);
       });
 
       socket.on("message", (raw) => {
-        if (!isRuntimeLive()) return;
+        // Only the established socket speaks for this terminal; a cancelled or
+        // superseded one is inert.
+        if (ws !== socket || !isRuntimeLive()) return;
         const msg = safeParse(raw.toString());
         if (msg) handleIncoming(msg);
       });
 
       socket.on("close", () => {
+        settle(false); // pre-open failure; a no-op once established
+        if (ws !== socket) return; // a stale socket owns none of the state below
         ws = null;
         if (disposed) return;
-        if (role === "client") {
-          role = "disconnected";
-          connectedTerminals = [];
-          updateStatus();
+        role = "disconnected";
+        connectedTerminals = [];
+        // Drop this connection's snapshots: a reconnect — or a promotion to hub —
+        // must not serve metadata from the network that just went away.
+        terminalStatuses.clear();
+        terminalCwds.clear();
+        terminalContexts.clear();
+        updateStatus();
 
-          if (!manuallyDisconnected) {
-            notify("Disconnected from link hub", "warning");
-            scheduleReconnect();
-          }
+        if (!manuallyDisconnected) {
+          notify("Disconnected from link hub", "warning");
+          scheduleReconnect();
         }
       });
 
       socket.on("error", () => {
-        if (!resolved) {
-          resolved = true;
-          resolve(false);
-        }
+        settle(false);
         socket.close();
       });
     });
@@ -1070,17 +1213,77 @@ export default function (pi: ExtensionAPI) {
 
   // ── Initialize (auto-discover) ──────────────────────────────────────────
 
-  async function initialize() {
-    if (disposed) return;
+  /** True while `attempt` still owns establishment and the terminal still wants it. */
+  function attemptIsCurrent(attempt: ConnectionAttempt): boolean {
+    return connectionAttempt === attempt && !disposed && !manuallyDisconnected;
+  }
 
-    // Try connecting to an existing hub
-    if (await connectAsClient()) return;
+  /**
+   * Single-flight: startup, reconnect and `/link-connect` all join the one attempt
+   * in flight instead of dialing again, because `role` stays "disconnected" for as
+   * long as establishment takes and is therefore no guard at all.
+   */
+  function initialize(): Promise<void> {
+    if (disposed || manuallyDisconnected) return Promise.resolve();
+    if (connectionAttempt) return connectionAttempt.promise;
+    // The record is the generation token, so it has to exist before the first
+    // transport does; `promise` is replaced on the next line.
+    const attempt: ConnectionAttempt = {
+      promise: Promise.resolve(),
+      socket: null,
+      server: null,
+      httpServer: null,
+    };
+    connectionAttempt = attempt;
+    attempt.promise = runAttempt(attempt);
+    return attempt.promise;
+  }
 
-    // No hub found — become the hub
-    if (await startHub()) return;
+  async function runAttempt(attempt: ConnectionAttempt) {
+    try {
+      // Try connecting to an existing hub
+      if (await connectAsClient(attempt)) return;
+      if (!attemptIsCurrent(attempt)) return;
 
-    // Port busy but couldn't connect (rare race). Retry after delay.
-    scheduleReconnect();
+      // No hub found — become the hub
+      if (await startHub(attempt)) return;
+      if (!attemptIsCurrent(attempt)) return;
+
+      // Port busy but couldn't connect (rare race). Retry after delay.
+      scheduleReconnect();
+    } finally {
+      // Only while still the owner: an attempt cancelled mid-flight must not clear
+      // the slot a newer one has already taken.
+      if (connectionAttempt === attempt) connectionAttempt = null;
+    }
+  }
+
+  /**
+   * Drop the attempt in flight. Invalidating it first means any callback arriving
+   * while its transports unwind is already stale; closing the pending handles is
+   * what makes those callbacks arrive at all, so the attempt settles instead of
+   * being abandoned. Also clears both connect timers, so a disconnect before the
+   * startup callback constructs nothing.
+   */
+  function cancelConnectionAttempt() {
+    if (startupConnectTimer) {
+      clearTimeout(startupConnectTimer);
+      startupConnectTimer = null;
+    }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    const attempt = connectionAttempt;
+    if (!attempt) return;
+    connectionAttempt = null;
+    // Read every handle first: closing the WS server can settle the attempt, and
+    // settling clears these fields. Closing the HTTP server is not optional — it
+    // holds the port, so a skipped close squats :9900 for the whole machine.
+    const { socket, server, httpServer } = attempt;
+    socket?.close();
+    server?.close();
+    httpServer?.close();
   }
 
   function scheduleReconnect() {
@@ -1089,43 +1292,27 @@ export default function (pi: ExtensionAPI) {
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (role === "disconnected" && !disposed && !manuallyDisconnected)
-        initialize();
+        void initialize();
     }, delay);
   }
 
   // ── Cleanup ──────────────────────────────────────────────────────────────
 
   function disconnect() {
-    // Clear reconnect timer first to prevent races
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    // Cancel establishment first, so nothing in flight can commit state behind us.
+    // This also clears the reconnect and startup timers.
+    cancelConnectionAttempt();
 
-    // Clean up target-side remote prompt state
-    if (keepaliveTimer) {
-      clearInterval(keepaliveTimer);
-      keepaliveTimer = null;
-    }
-    pendingRemotePrompt = null;
+    // Clear link-owned remote compaction state; a local /compact survives disconnect.
     compactRunning = false;
-
-    // Clean up pending prompts and compacts
-    for (const id of [...pendingPromptResponses.keys()]) {
-      const pending = cleanupPending(id);
-      if (pending) {
-        pending.resolve(
-          textResult("Link disconnected", { error: "disconnected" }),
-        );
-      }
-    }
-    for (const id of [...pendingCompactResponses.keys()]) {
-      const pending = cleanupPendingCompact(id);
-      if (pending) {
-        pending.resolve(
-          textResult("Link disconnected", { error: "disconnected" }),
-        );
-      }
+    // Runs before role is cleared, so peers still get a final status; more to the
+    // point, the local gate record stays honest for the reconnect.
+    syncCompactionStatus();
+    for (const [id, pending] of pendingCompactResponses) {
+      cleanupPendingCompact(id);
+      pending.resolve(
+        textResult("Link disconnected", { error: "disconnected" }),
+      );
     }
 
     // Close client connection
@@ -1140,41 +1327,35 @@ export default function (pi: ExtensionAPI) {
       hubClients.clear();
       wss.close();
       wss = null;
+      hubHttpServer?.close();
+      hubHttpServer = null;
     }
 
     role = "disconnected";
     connectedTerminals = [];
     terminalStatuses.clear();
-    hubTerminalStatuses.clear();
     terminalContexts.clear();
-    hubTerminalContexts.clear();
     terminalCwds.clear();
-    hubTerminalCwds.clear();
-    lastPushedKind = null;
-    lastPushedTool = null;
+    lastPushedStatus = null;
     updateStatus();
 
-    // Inbox survives disconnect — messages are local state waiting for local delivery.
-    // Ensure pending flush still fires.
-    if (inbox.length > 0 && !flushTimer) {
-      scheduleFlush(FLUSH_DELAY_MS);
-    }
+    // Inbox survives disconnect; flush unless a local /compact still gates it.
+    if (!flushTimer) releaseInbox();
   }
 
   function cleanup() {
     disposed = true;
-    if (startupConnectTimer) {
-      clearTimeout(startupConnectTimer);
-      startupConnectTimer = null;
-    }
+    // disconnect() cancels the attempt in flight, including the startup timer.
     disconnect();
     ctx = undefined;
-    // Full teardown: clear inbox and flush timer
+    // Full teardown: clear inbox and both timers. The compaction deadline runs to
+    // 300s, so it would otherwise outlive the extension and fire after teardown.
     inbox.length = 0;
     if (flushTimer) {
       clearTimeout(flushTimer);
       flushTimer = null;
     }
+    setCompacting(false);
   }
 
   // ── Lifecycle events ─────────────────────────────────────────────────────
@@ -1250,69 +1431,90 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", async () => {
+    const before = statusIdentity(deriveStatus());
     agentRunning = true;
-    activeToolName = null;
-    stateSince = Date.now();
+    // Safe only under the current deployment, not by Pi's guarantees:
+    // AgentSession.prompt() refuses to run during compaction, and the only caller
+    // of pi.sendMessage here — flushInbox() — is itself gated, so nothing can start
+    // a run mid-compaction. Another extension calling pi.sendMessage with
+    // triggerTurn: true would void that: its message starts a run during a
+    // compaction, agent_start clears this flag, and delivery reopens into a
+    // compaction that is still rebuilding context.
+    setCompacting(false);
+    if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
     pushStatus();
   });
 
+  pi.on("session_before_compact", async (event) => {
+    // Manual only. Automatic (threshold/overflow) compaction runs inside the agent
+    // run, so a delivered message takes Pi's steering arm and _runAutoCompaction
+    // returns hasQueuedMessages() to drain it afterwards. Gating it would replace a
+    // working Pi path with our own.
+    //
+    // There is deliberately no abort listener: event.signal firing is not an ending.
+    // Pi passes that signal into the summarizer and its compaction controller lives
+    // until the catch/finally, so releasing on abort would re-open delivery while the
+    // aborted compaction is still unwinding. A cancelled compaction is released by
+    // the user's next run (agent_start) or by the deadline.
+    //
+    // Accepted gap: compact() aborts, authorises and prepares *before* emitting this
+    // event, so a flush in that window can still start a turn against context about
+    // to be rebuilt. The message itself survives — it is persisted and restored — so
+    // only the turn is wasted. No heuristics to guess at the window. This is a
+    // manual-compaction limit only; remote compaction is already gated by
+    // compactRunning, set before ctx.compact() is ever called.
+    if (event.reason === "manual") setCompacting(true);
+  });
+
   pi.on("session_compact", async () => {
+    setCompacting(false); // compaction succeeded
     // Tokens just dropped sharply — force a push so peers see the new context.
     pushStatus(true);
   });
 
+  pi.on("model_select", async () => {
+    pushStatus(true); // the window, and so the usage percentage, belongs to the model
+  });
+
+  pi.on("session_tree", async () => {
+    pushStatus(true); // context usage belongs to the active branch
+  });
+
   pi.on("tool_execution_start", async (event) => {
-    activeToolName = event.toolName;
-    stateSince = Date.now();
+    const before = statusIdentity(deriveStatus());
+    activeTools.set(event.toolCallId, event.toolName);
+    if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
     pushStatus();
   });
 
-  pi.on("tool_execution_end", async () => {
-    activeToolName = null;
-    if (agentRunning) stateSince = Date.now();
+  pi.on("tool_execution_end", async (event) => {
+    const before = statusIdentity(deriveStatus());
+    activeTools.delete(event.toolCallId); // this call only; others may still run
+    if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
     pushStatus();
   });
 
-  pi.on("agent_end", async (event) => {
+  pi.on("agent_end", async () => {
+    const before = statusIdentity(deriveStatus());
+    // agentRunning deliberately survives this event. Pi may still auto-retry, run an
+    // automatic compaction, or drain a queued continuation, all inside the same run;
+    // reporting idle here would advertise a terminal that is still working.
+    activeTools.clear(); // defensive: an unmatched end would otherwise pin the status
+    if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
+    pushStatus();
+  });
+
+  pi.on("agent_settled", async (_event, settledCtx) => {
+    // The authoritative end of a run: Pi emits this once no retry, compaction or
+    // queued continuation is left. It can still be followed immediately by a new run
+    // another extension started during settlement, whose agent_start already set the
+    // flag we would be clearing — so ask Pi instead of assuming, and leave a newer
+    // run reporting thinking.
+    if (!settledCtx.isIdle()) return;
+    const before = statusIdentity(deriveStatus());
     agentRunning = false;
-    activeToolName = null;
-    stateSince = Date.now();
+    if (statusIdentity(deriveStatus()) !== before) stateSince = Date.now();
     pushStatus();
-
-    // Wake up inbox flush — agent_end fires before finishRun(), so ctx.isIdle()
-    // is still false here. scheduleFlush(0) defers to next macrotask when idle.
-    if (inbox.length > 0) scheduleFlush(0);
-
-    // If we were running a remote prompt, send the response back
-    if (pendingRemotePrompt) {
-      const { id, from } = pendingRemotePrompt;
-      if (keepaliveTimer) {
-        clearInterval(keepaliveTimer);
-        keepaliveTimer = null;
-      }
-      pendingRemotePrompt = null;
-
-      // Find the last assistant text in this run
-      let responseText = "";
-      for (let i = event.messages.length - 1; i >= 0; i--) {
-        const msg = event.messages[i];
-        if (msg.role === "assistant") {
-          responseText = msg.content
-            .filter((c: { type: string }) => c.type === "text")
-            .map((c: { type: string; text?: string }) => c.text ?? "")
-            .join("\n");
-          break;
-        }
-      }
-
-      routeMessage({
-        type: "prompt_response",
-        id,
-        from: terminalName,
-        to: from,
-        response: responseText || "(no response)",
-      });
-    }
   });
 
   // ── Tool helpers ──────────────────────────────────────────────────────────
@@ -1325,17 +1527,36 @@ export default function (pi: ExtensionAPI) {
     return textResult("Not connected to link", { error: "not_connected" });
   }
 
-  function truncatePreview(text: string, max = 60) {
-    return text.length > max ? text.slice(0, max) + "..." : text;
+  // Collapsed one-line preview for the two outgoing tools. Whitespace is normalized so a
+  // multiline message stays on the tool's single preview line, then clipped to 60
+  // characters. The hint appears only when characters are actually hidden: expanding shows
+  // the original text, so collapsing whitespace alone is not something to advertise.
+  // Styling is applied per segment, like messagePreview above: the hint ends with a
+  // foreground reset, so punctuation appended after it would render undimmed.
+  function truncatePreview(text: string, dim: (text: string) => string) {
+    const preview = text.replace(/\s+/g, " ");
+    return preview.length > 60
+      ? dim(preview.slice(0, 60) + "... (") +
+          expansionHint(dim) +
+          dim(")")
+      : dim(preview);
   }
 
-  // Shared "target not found" result for the send/prompt/compact tools.
+  // The agent's and the user's view of the roster: same group only. Routing never
+  // uses this — the hub routes over hubClients; this is a lens over connectedTerminals.
+  function visibleTerminals(): string[] {
+    const group = groupOf(terminalName);
+    return connectedTerminals.filter((n) => groupOf(n) === group);
+  }
+
+  // Shared "target not found" result for the send/compact tools.
   // Returns null when the target is present, so callers can `if (miss) return miss;`.
   function targetNotFound(to: string) {
-    return connectedTerminals.includes(to)
+    const visible = visibleTerminals();
+    return visible.includes(to)
       ? null
       : textResult(
-          `Terminal "${to}" not found. Connected: ${connectedTerminals.join(", ")}`,
+          `Terminal "${to}" not found. Connected: ${visible.join(", ")}`,
           { to, error: "not_found" },
         );
   }
@@ -1356,52 +1577,40 @@ export default function (pi: ExtensionAPI) {
   // ── Tools ────────────────────────────────────────────────────────────────
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "link_send",
     label: "Link Send",
-    loadMode: "essential",
     description: [
-      "Send a message to another Pi terminal on the link.",
-      'Use to:"*" for broadcast. Set triggerTurn:true to make the receiving terminal\'s LLM respond.',
+      "Send a message to one other Pi terminal on the link.",
+      "The message always acts: it steers a busy receiver at its next safe boundary, or starts a turn on an idle one.",
     ].join(" "),
     promptSnippet:
       "Send a message to another Pi terminal on the local link network",
     parameters: Type.Object({
-      to: Type.String({
-        description: 'Target terminal name, or "*" for broadcast',
-      }),
+      to: Type.String({ description: "Target terminal name" }),
       message: Type.String({ description: "Message content" }),
-      triggerTurn: Type.Optional(
-        Type.Boolean({
-          description:
-            "Whether to trigger an LLM turn on the receiver (default: false)",
-        }),
-      ),
     }),
 
     async execute(_toolCallId, params) {
       if (role === "disconnected") return notConnectedResult();
 
-      // Pre-validate target exists locally (best-effort, catches typos and definitely-absent names)
-      if (params.to !== "*") {
-        if (params.to === terminalName) {
-          return textResult("Cannot send to yourself", {
-            to: params.to,
-            error: "self_target",
-          });
-        }
-        const miss = targetNotFound(params.to);
-        if (miss) return miss;
+      if (params.to === terminalName) {
+        return textResult("Cannot send to yourself", {
+          to: params.to,
+          error: "self_target",
+        });
       }
+      const miss = targetNotFound(params.to);
+      if (miss) return miss;
 
       const delivered = routeMessage({
         type: "chat",
         from: terminalName,
         to: params.to,
         content: params.message,
-        triggerTurn: params.triggerTurn ?? false,
       });
 
-      const target = params.to === "*" ? "all terminals" : `"${params.to}"`;
+      const target = `"${params.to}"`;
       if (!delivered) {
         return textResult(`Failed to send to ${target}`, {
           to: params.to,
@@ -1410,22 +1619,22 @@ export default function (pi: ExtensionAPI) {
       }
       // Hub delivery is authoritative; client delivery is optimistic (hub routes)
       const verb = role === "hub" ? "Sent to" : "Sent to hub for delivery to";
-      return textResult(`${verb} ${target}`, {
-        to: params.to,
-        triggerTurn: params.triggerTurn ?? false,
-      });
+      return textResult(`${verb} ${target}`, { to: params.to });
     },
 
-    renderCall(args, theme) {
-      const target = args.to === "*" ? "broadcast" : args.to;
+    renderCall(args, theme, context) {
+      const dim = (text: string) => theme.fg("dim", text);
       const preview =
         typeof args.message === "string"
-          ? truncatePreview(args.message)
-          : "...";
-      let text = theme.fg("toolTitle", theme.bold("link_send "));
-      text += theme.fg("accent", target);
-      if (args.triggerTurn) text += theme.fg("warning", " (trigger)");
-      text += "\n  " + theme.fg("dim", preview);
+          ? context.expanded
+            ? dim(args.message)
+            : truncatePreview(args.message, dim)
+          : dim("...");
+      const text =
+        theme.fg("toolTitle", theme.bold("link_send ")) +
+        theme.fg("accent", args.to) +
+        "\n  " +
+        preview;
       return new Text(text, 0, 0);
     },
 
@@ -1433,13 +1642,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "link_compact",
     label: "Link Compact",
-    loadMode: "essential",
     description: [
       "Ask another Pi terminal to compact its context window and wait until it finishes.",
-      "Returns once the target has compacted, so you can immediately send it new work.",
-      "Busy targets (mid-turn or already compacting) decline; retry when idle.",
+      "A target declines unless Pi reports its session idle and no compaction holds its gate, so an active run, retry, automatic compaction, queued continuation or reported `compacting` all decline.",
     ].join(" "),
     promptSnippet: "Ask another Pi terminal to compact its context window",
     parameters: Type.Object({
@@ -1462,7 +1670,7 @@ export default function (pi: ExtensionAPI) {
       if (role === "disconnected") return notConnectedResult();
 
       if (params.to === terminalName) {
-        return textResult("Cannot compact yourself - use /compact.", {
+        return textResult("Cannot compact yourself.", {
           to: params.to,
           error: "self_target",
         });
@@ -1479,7 +1687,7 @@ export default function (pi: ExtensionAPI) {
           if (pending) {
             pending.resolve(
               textResult(
-                `Compact request to "${params.to}" timed out (${COMPACT_TIMEOUT_MS / 1000}s)`,
+                `Compact request to "${params.to}" timed out after ${COMPACT_TIMEOUT_MS / 1000}s; the target may still be compacting.`,
                 { to: params.to, error: "timeout" },
               ),
             );
@@ -1530,11 +1738,16 @@ export default function (pi: ExtensionAPI) {
       });
     },
 
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       let text = theme.fg("toolTitle", theme.bold("link_compact "));
       text += theme.fg("accent", String(args.to));
+      const dim = (t: string) => theme.fg("dim", t);
       if (typeof args.instructions === "string")
-        text += "\n  " + theme.fg("dim", truncatePreview(args.instructions));
+        text +=
+          "\n  " +
+          (context.expanded
+            ? dim(args.instructions)
+            : truncatePreview(args.instructions, dim));
       return new Text(text, 0, 0);
     },
 
@@ -1542,142 +1755,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "link_prompt",
-    label: "Link Prompt",
-    loadMode: "essential",
-    description: [
-      "Send a prompt to another Pi terminal and wait for its LLM to respond.",
-      "The remote terminal processes the prompt as if a user typed it,",
-      "then returns the assistant's response. Times out after 90s of inactivity.",
-    ].join(" "),
-    promptSnippet:
-      "Send a prompt to another Pi terminal and receive its LLM response",
-    parameters: Type.Object({
-      to: Type.String({ description: "Target terminal name" }),
-      prompt: Type.String({ description: "Prompt to send" }),
-    }),
-
-    async execute(_toolCallId, params, signal) {
-      if (signal?.aborted) {
-        return textResult("Prompt request aborted", {
-          to: params.to,
-          error: "aborted",
-        });
-      }
-
-      if (role === "disconnected") return notConnectedResult();
-
-      if (params.to === terminalName) {
-        return textResult("Cannot prompt yourself", {
-          to: params.to,
-          error: "self_target",
-        });
-      }
-
-      const miss = targetNotFound(params.to);
-      if (miss) return miss;
-
-      const requestId = crypto.randomUUID();
-
-      return new Promise((resolve) => {
-        const inactivityTimeout = makeInactivityTimeout(requestId, params.to);
-
-        const ceilingTimeout = setTimeout(() => {
-          const pending = cleanupPending(requestId);
-          if (pending) {
-            pending.resolve(
-              textResult(
-                `Prompt to "${params.to}" hit hard ceiling (${PROMPT_HARD_CEILING_MS / 60_000}min)`,
-                { to: params.to, error: "timeout" },
-              ),
-            );
-          }
-        }, PROMPT_HARD_CEILING_MS);
-
-        pendingPromptResponses.set(requestId, {
-          resolve,
-          targetName: params.to,
-          inactivityTimeout,
-          ceilingTimeout,
-        });
-
-        // Abort handling
-        signal?.addEventListener(
-          "abort",
-          () => {
-            const pending = cleanupPending(requestId);
-            if (pending) {
-              pending.resolve(
-                textResult("Prompt request aborted", {
-                  to: params.to,
-                  error: "aborted",
-                }),
-              );
-            }
-          },
-          { once: true },
-        );
-
-        const delivered = routeMessage({
-          type: "prompt_request",
-          id: requestId,
-          from: terminalName,
-          to: params.to,
-          prompt: params.prompt,
-        });
-
-        if (!delivered) {
-          const pending = cleanupPending(requestId);
-          if (pending) {
-            pending.resolve(
-              textResult(`Failed to send prompt to "${params.to}"`, {
-                to: params.to,
-                error: "not_delivered",
-              }),
-            );
-          }
-        }
-      });
-    },
-
-    renderCall(args, theme) {
-      const preview =
-        typeof args.prompt === "string" ? truncatePreview(args.prompt) : "...";
-      let text = theme.fg("toolTitle", theme.bold("link_prompt "));
-      text += theme.fg("accent", args.to ?? "...");
-      text += "\n  " + theme.fg("dim", preview);
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _options, theme) {
-      const txt = result.content[0];
-      const details = result.details as Record<string, unknown> | undefined;
-      if (details?.error) {
-        return new Text(
-          theme.fg("error", "✗ ") + (txt?.type === "text" ? txt.text : ""),
-          0,
-          0,
-        );
-      }
-      const from = details?.from ?? "unknown";
-      const response = txt?.type === "text" ? txt.text : "";
-      const preview = truncatePreview(response, 200);
-      return new Text(
-        theme.fg("success", "✓ ") +
-          theme.fg("accent", `[${from}] `) +
-          theme.fg("text", preview),
-        0,
-        0,
-      );
-    },
-  });
-
-  pi.registerTool({
+    ...TOP_LEVEL_TOOL,
     name: "link_list",
     label: "Link List",
-    loadMode: "essential",
-    description: "List all Pi terminals currently connected to the link.",
-    promptSnippet: "List connected Pi terminals on the link",
+    description: "List the Pi terminals in your group currently connected to the link.",
+    promptSnippet: "List connected Pi terminals in your group",
     parameters: Type.Object({}),
 
     async execute() {
@@ -1686,7 +1768,8 @@ export default function (pi: ExtensionAPI) {
       const statuses: Record<string, string> = {};
       const cwds: Record<string, string> = {};
       const contexts: Record<string, ContextSnapshot> = {};
-      const list = connectedTerminals
+      const visible = visibleTerminals();
+      const list = visible
         .map((name) => {
           const status = getStatusFor(name);
           const statusStr = status ? formatStatus(status) : "";
@@ -1705,7 +1788,7 @@ export default function (pi: ExtensionAPI) {
         .join("\n");
 
       return textResult(`Connected terminals:\n${list}`, {
-        terminals: connectedTerminals,
+        terminals: visible,
         statuses,
         cwds,
         contexts,
@@ -1759,7 +1842,8 @@ export default function (pi: ExtensionAPI) {
         _ctx.ui.notify("Link: not connected", "warning");
         return;
       }
-      const lines = connectedTerminals.map((name) => {
+      const visible = visibleTerminals();
+      const lines = visible.map((name) => {
         const status = getStatusFor(name);
         const statusStr = status ? formatStatus(status) : "";
         const cwd = getCwdFor(name);
@@ -1771,7 +1855,7 @@ export default function (pi: ExtensionAPI) {
         return line;
       });
       _ctx.ui.notify(
-        `Link: ${terminalName} (${role}) · ${connectedTerminals.length} online\n${lines.join("\n")}`,
+        `Link: ${terminalName} (${role}) · ${visible.length} online\n${lines.join("\n")}`,
         "info",
       );
     },
@@ -1813,7 +1897,6 @@ export default function (pi: ExtensionAPI) {
 
       // If we're the hub, check uniqueness before persisting
       if (role === "hub") {
-        // Check if name is taken by another terminal
         const takenByOther = Array.from(hubClients.values()).includes(newName);
         if (takenByOther) {
           _ctx.ui.notify(
@@ -1863,39 +1946,15 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("link-broadcast", {
-    description: "Broadcast a message to all connected terminals",
-    handler: async (args, _ctx) => {
-      const message = args.trim();
-      if (!message) {
-        _ctx.ui.notify("Usage: /link-broadcast <message>", "warning");
-        return;
-      }
-      if (role === "disconnected") {
-        _ctx.ui.notify("Not connected to link", "warning");
-        return;
-      }
-      routeMessage({
-        type: "chat",
-        from: terminalName,
-        to: "*",
-        content: message,
-        triggerTurn: false,
-      });
-      _ctx.ui.notify("Broadcast sent", "info");
-    },
-  });
-
   pi.registerCommand("link-disconnect", {
     description: "Disconnect from the link",
     handler: async (_args, _ctx) => {
       pi.appendEntry("link-active", { active: false });
       manuallyDisconnected = true;
       if (role === "disconnected") {
-        if (reconnectTimer) {
-          clearTimeout(reconnectTimer);
-          reconnectTimer = null;
-        }
+        // Nothing is established, but a startup or reconnect attempt may still be
+        // dialing or binding; persisted intent has to win over it too.
+        cancelConnectionAttempt();
         _ctx.ui.notify("Link disconnected", "info");
         return;
       }
@@ -1922,12 +1981,22 @@ export default function (pi: ExtensionAPI) {
 
   // ── Message renderer ─────────────────────────────────────────────────────
 
-  pi.registerMessageRenderer("link", (message, _options, theme) => {
+  pi.registerMessageRenderer("link", (message, options, theme) => {
     const from =
       (message.details as Record<string, unknown> | undefined)?.from ?? "link";
     const text =
       theme.fg("accent", `⚡ [${from}] `) +
       theme.fg("text", String(message.content));
-    return new Text(text, 0, 0);
+    const content = new Text(text, 0, 0);
+    // The same panel Pi draws around extension messages by default: returning our own
+    // component bypasses the host's box, so a link message would otherwise sit unframed
+    // among framed ones. `outputPad` is the user's configured output padding.
+    const box = new Box(options.outputPad, 1, (t) => theme.bg("customMessageBg", t));
+    box.addChild(
+      options.expanded
+        ? content
+        : messagePreview(content, (s) => theme.fg("muted", s)),
+    );
+    return box;
   });
 }
