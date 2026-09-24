@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { discoverTeam, loadTeamConfig, validateTeamConfig, formatTeamReport } from '../lib/team-config.mjs';
+import { discoverTeam, loadTeamConfig, validateTeamConfig, formatTeamReport } from '../bin/team-config.mjs';
 
 async function tempRepo() {
   return fs.mkdtemp(path.join(os.tmpdir(), 'pi-link-team-'));
@@ -32,7 +32,7 @@ test('loads a JSON team manifest and normalizes role paths relative to the repos
   assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
 });
 
-test('loads the supported simple YAML team manifest', async () => {
+test('loads a YAML team manifest using standard YAML features', async () => {
   const root = await tempRepo();
   await fs.mkdir(path.join(root, '.pi-link'));
   await fs.writeFile(path.join(root, '.pi-link', 'team.yml'), [
@@ -47,15 +47,28 @@ test('loads the supported simple YAML team manifest', async () => {
     '  advisor:',
     '    role: coordinator',
     '    profile: .omp/agents/advisor.md',
+    // A colon inside a quoted scalar must not be treated as a key separator.
+    '    summary: "Coordinate: keep peers unblocked"',
     '    skills:',
     '      required: [team-workflow]',
     '    tools:',
     '      required: [read]',
+    '      requestable:',
+    '        - browser',
+    '  builder:',
+    '    role: member',
+    // A block scalar with real newlines must survive parsing intact.
+    '    instructions: |',
+    '      Build the thing.',
+    '      Then verify it.',
   ].join('\n'));
 
   const config = await loadTeamConfig(root);
   assert.equal(config.team.group, 'demo');
+  assert.equal(config.roles.advisor.summary, 'Coordinate: keep peers unblocked');
   assert.deepEqual(config.roles.advisor.skills.required, ['team-workflow']);
+  assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
+  assert.equal(config.roles.builder.instructions, 'Build the thing.\nThen verify it.\n');
 });
 
 test('discovers profiles, skills, and launch scripts without writing files', async () => {

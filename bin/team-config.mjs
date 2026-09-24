@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { parse as parseYaml } from 'yaml';
 
 const MANIFEST_CANDIDATES = [
   '.pi-link/team.yml',
@@ -32,44 +33,11 @@ async function walkFiles(root) {
   return files;
 }
 
-function parseScalar(value) {
-  const trimmed = value.trim();
-  if (!trimmed) return '';
-  if (trimmed === 'true') return true;
-  if (trimmed === 'false') return false;
-  if (/^-?\d+$/.test(trimmed)) return Number(trimmed);
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
-    return trimmed.slice(1, -1);
-  }
-  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
-    const body = trimmed.slice(1, -1).trim();
-    return body ? body.split(',').map((item) => parseScalar(item)) : [];
-  }
-  return trimmed;
-}
-
-function parseSimpleYaml(text) {
-  const root = {};
-  const stack = [{ indent: -1, value: root }];
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.replace(/\s+#.*$/, '');
-    if (!line.trim() || line.trim().startsWith('#')) continue;
-    const indent = line.length - line.trimStart().length;
-    const content = line.trim();
-    const separator = content.indexOf(':');
-    if (separator < 1) throw new Error(`Unsupported YAML line: ${rawLine}`);
-    const key = content.slice(0, separator).trim();
-    const rawValue = content.slice(separator + 1).trim();
-    while (stack.length > 1 && indent <= stack.at(-1).indent) stack.pop();
-    const parent = stack.at(-1).value;
-    if (!rawValue) {
-      parent[key] = {};
-      stack.push({ indent, value: parent[key] });
-    } else {
-      parent[key] = parseScalar(rawValue);
-    }
-  }
-  return root;
+function parseManifest(text, manifestPath) {
+  if (manifestPath.endsWith('.json')) return JSON.parse(text);
+  const parsed = parseYaml(text);
+  // An empty manifest is a valid but empty configuration, not a parse failure.
+  return parsed ?? {};
 }
 
 function parseFrontmatter(text) {
@@ -77,7 +45,7 @@ function parseFrontmatter(text) {
   const end = text.indexOf('\n---', 3);
   if (end < 0) return {};
   try {
-    return parseSimpleYaml(text.slice(4, end));
+    return parseYaml(text.slice(4, end)) ?? {};
   } catch {
     return {};
   }
@@ -107,9 +75,7 @@ export async function loadTeamConfig(root) {
     const manifestPath = path.join(root, relativePath);
     if (!(await exists(manifestPath))) continue;
     const text = await fs.readFile(manifestPath, 'utf8');
-    let parsed;
-    if (manifestPath.endsWith('.json')) parsed = JSON.parse(text);
-    else parsed = parseSimpleYaml(text);
+    const parsed = parseManifest(text, manifestPath);
     const roles = Object.fromEntries(Object.entries(parsed.roles ?? {}).map(([name, role]) => [name, normalizeRole(role, root)]));
     return {
       ...parsed,

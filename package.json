@@ -28,7 +28,8 @@
     "multi-agent"
   ],
   "dependencies": {
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/ws": "^8.18.1"
