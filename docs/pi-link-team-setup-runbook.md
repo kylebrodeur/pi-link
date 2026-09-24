@@ -109,7 +109,7 @@ This touches nothing: no npm global, no OMP profile, no Pi settings, no `PATH`.
 
 ```bash
 cd /private/tmp/pi-link-team-setup
-npm install --omit=dev      # installs `yaml` (^2.9.x), the declared runtime dep
+npm install --omit=dev      # installs `ws`, the only runtime dep
 ```
 
 ## Step 1 — sanity checks
@@ -117,7 +117,7 @@ npm install --omit=dev      # installs `yaml` (^2.9.x), the declared runtime dep
 ```bash
 cd /private/tmp/pi-link-team-setup
 node bin/pi-link.mjs --version          # 0.5.1
-node --test test/team-config.test.mjs test/cli-team.test.mjs   # 8 pass
+node --test test/team-config.test.mjs test/cli-team.test.mjs   # 13 pass
 node --check bin/pi-link.mjs && node --check bin/team-config.mjs
 ```
 
@@ -133,32 +133,30 @@ printf -- '---\nrole: member\n---\nYou build.\n'                          > "$SB
 printf '# Team Workflow\n'                                                > "$SB/.omp/skills/team-workflow/SKILL.md"
 printf '#!/bin/sh\necho start\n'                                          > "$SB/scripts/start-team.sh"
 
-cat > "$SB/.pi-link/team.yml" <<'YAML'
-version: 1
-team:
-  name: e2e
-  group: e2e
-hub:
-  role: advisor
-  mode: designated
-roles:
-  advisor:
-    role: coordinator
-    profile: .omp/agents/advisor.md
-    summary: "Coordinate: keep peers unblocked"
-    skills:
-      required: [team-workflow]
-    tools:
-      required: [read, link_list, link_send]
-      requestable:
-        - browser
-  builder:
-    role: member
-    profile: .omp/agents/builder.md
-    instructions: |
-      Build the thing.
-      Then verify it.
-YAML
+cat > "$SB/.pi-link/team.json" <<'JSON'
+{
+  "version": 1,
+  "team": { "name": "e2e", "group": "e2e" },
+  "hub": { "role": "advisor", "mode": "designated" },
+  "roles": {
+    "advisor": {
+      "role": "coordinator",
+      "profile": ".omp/agents/advisor.md",
+      "summary": "Coordinate: keep peers unblocked",
+      "skills": { "required": ["team-workflow"] },
+      "tools": {
+        "required": ["read", "link_list", "link_send"],
+        "requestable": ["browser"]
+      }
+    },
+    "builder": {
+      "role": "member",
+      "profile": ".omp/agents/builder.md",
+      "instructions": "Build the thing.\nThen verify it."
+    }
+  }
+}
+JSON
 ```
 
 ## Step 3 — exercise the commands
@@ -181,36 +179,35 @@ rm -rf "$B"; mkdir -p "$B/.pi-link" "$B/.omp/agents"
 printf -- '---\nrole: member\n---\n' > "$B/.omp/agents/advisor.md"
 
 # 4a. missing profile file -> exit 1
-cat > "$B/.pi-link/team.yml" <<'YAML'
-version: 1
-team: { name: neg, group: neg }
-hub: { role: advisor, mode: designated }
-roles:
-  advisor:
-    role: coordinator
-    profile: .omp/agents/does-not-exist.md
-YAML
+cat > "$B/.pi-link/team.json" <<'JSON'
+{
+  "version": 1,
+  "team": { "name": "neg", "group": "neg" },
+  "hub": { "role": "advisor", "mode": "designated" },
+  "roles": {
+    "advisor": { "role": "coordinator", "profile": ".omp/agents/does-not-exist.md" }
+  }
+}
+JSON
 (cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR ... missing / exit=1
 
 # 4b. no hub at all -> exit 1
-cat > "$B/.pi-link/team.yml" <<'YAML'
-version: 1
-team: { name: neg, group: neg }
-roles:
-  advisor:
-    role: coordinator
-    profile: .omp/agents/advisor.md
-YAML
+cat > "$B/.pi-link/team.json" <<'JSON'
+{
+  "version": 1,
+  "team": { "name": "neg", "group": "neg" },
+  "roles": {
+    "advisor": { "role": "coordinator", "profile": ".omp/agents/advisor.md" }
+  }
+}
+JSON
 (cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR hub.role is required / exit=1
 
-# 4c. malformed YAML -> clean error, exit 1 (no stack trace)
-cat > "$B/.pi-link/team.yml" <<'YAML'
-version: 1
-roles:
-  advisor:
-    profile: [
-YAML
-(cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR failed to read team manifest / exit=1
+# 4c. malformed JSON -> clean error, exit 1 (no stack trace)
+cat > "$B/.pi-link/team.json" <<'JSON'
+{ "version": 1, "roles": { "advisor": { "profile": [
+JSON
+(cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR team manifest is not valid JSON / exit=1
 ```
 
 ## Step 5 — packed artifact guard

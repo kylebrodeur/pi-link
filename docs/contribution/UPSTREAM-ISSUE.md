@@ -59,7 +59,7 @@ A CLI surface — **read-only first** — that:
 
 - discovers existing artifacts rather than owning them: `.omp/agents/`, `.agents/`,
   `.omp/skills/`, `.agents/skills/`, `skills/`, `scripts/`
-- reads an optional declared composition at `.pi-link/team.yml` / `.yaml` / `.json`
+- reads an optional declared composition at `.pi-link/team.json`
 - normalizes and validates it: referenced profiles exist, referenced skills exist,
   a coordinator role is declared and names a real role, declared terminal names do not collide
 - reports required *errors* separately from optional *warnings*
@@ -70,22 +70,19 @@ of role prompts, skills, or project policy. Repository policy files keep their a
 
 Sketch:
 
-```yaml
-version: 1
-team:
-  name: project-name
-  group: project-name
-hub:
-  role: advisor
-  mode: designated
-roles:
-  advisor:
-    profile: .omp/agents/advisor.md
-    skills:
-      required: [team-workflow]
-    tools:
-      required: [read, link_list, link_send]
-      requestable: [browser]
+```json
+{
+  "version": 1,
+  "team": { "name": "project-name", "group": "project-name" },
+  "hub": { "role": "advisor", "mode": "designated" },
+  "roles": {
+    "advisor": {
+      "profile": ".omp/agents/advisor.md",
+      "skills": { "required": ["team-workflow"] },
+      "tools": { "required": ["read", "link_list", "link_send"], "requestable": ["browser"] }
+    }
+  }
+}
 ```
 
 ## Explicit non-goals
@@ -122,25 +119,30 @@ So a session named `team` becomes unreachable. Given the maintainer already made
 the consistent shape is a flag form (`pi-link --team`, `--team-check`, …) or a distinct binary,
 not a subcommand. **We would rather match the existing convention than argue for ours.**
 
-### 2. A third runtime dependency, or none
+### 2. Manifest format — we chose JSON-only to keep the single dependency
 
-Validation needs to read YAML. `package.json` currently declares exactly one runtime dependency
-(`ws`), and the README documents that as deliberate: *"At runtime pi-link needs one package,
-`ws`."* A manifest format choice therefore has a real cost:
+`package.json` declares exactly one runtime dependency (`ws`), and the README documents
+that as deliberate: *"At runtime pi-link needs one package, `ws`."* Reading a manifest
+therefore has a real cost, and we weighed three options:
 
 | Option | Trade-off |
 |---|---|
-| YAML via `yaml` | human-authored config, but a new runtime dep |
-| JSON only | zero new deps, less friendly for hand-editing, no comments |
+| YAML via `yaml` | human-authored config, but a second runtime dep |
+| **JSON only** | **zero new deps, matches pi-link's existing JSON surfaces, no comments** |
 | Restricted hand-rolled YAML | zero deps, but silently unsupported syntax (we built and then rejected this) |
 
-Our current prototype uses `yaml` (^2.9.x) and therefore adds a dependency. If upstream prefers
-to keep the single-dependency posture, JSON-only (or JSON plus a documented subset) is a
-perfectly acceptable answer from our side — we would rather ship the smaller surface.
+**We ship JSON-only.** It needs no parser dependency, and it matches the configuration
+surface pi-link already has: `settings.json`, session entries, `package.json`, the hub
+status payload, and the wire protocol are all JSON. Profile frontmatter keeps its
+YAML-shaped `key: value` scalars, read by hand the way Pi's own subagent tooling reads
+them — that is a frontmatter concern, not a manifest one.
+
+If upstream would rather have YAML and is willing to take the dependency, the format is a
+small change; everything else in the prototype is unaffected.
 
 ### Also worth deciding
 
-- Manifest location: `.pi-link/team.yml` vs a root-level file vs Pi-native config.
+- Manifest location: `.pi-link/team.json` vs a root-level file vs Pi-native config.
 - Whether `link_list` should eventually surface declared-vs-actual role, or whether that is
   scope creep.
 

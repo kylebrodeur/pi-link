@@ -8,7 +8,7 @@ Status: **draft, not opened.** Blocked on the two design questions in
 | # | Question | Why it blocks a PR |
 |---|---|---|
 | 1 | Subcommand vs flag for the `team` surface | Subcommand reintroduces the reserved-word collision upstream already fixed once (`list`/`resolve`). This likely changes every user-facing string. |
-| 2 | YAML dependency vs JSON-only | Adding `yaml` doubles the runtime dependency count. If upstream says no, the manifest format and parser change. |
+| 2 | Manifest format: YAML dep vs JSON-only | Resolved in our favor: **JSON-only**, no new dependency. Upstream could still prefer YAML, in which case the parser swaps and the shape stays. |
 
 Recommended posture: **ask in the issue first, ship the smaller surface.** If upstream
 prefers flags + JSON-only, the prototype's logic survives; only the CLI dispatch and the
@@ -26,8 +26,8 @@ Current branch diff vs `master` (975 insertions across 10 files):
 | `test/team-config.test.mjs` | new | 135 lines |
 | `test/cli-team.test.mjs` | new | 32 lines |
 | `test/fixtures/.pi-link/team.json` | new | fixture |
-| `package.json` | modified | adds `yaml` (see question 2) |
-| `package-lock.json` | modified | lock for the above |
+| `package.json` | **unchanged** | no dependency added — JSON-only (see question 2) |
+| `package-lock.json` | **unchanged** | no dependency added |
 | `docs/pi-link-team-setup-runbook.md` | new | **do not send** — internal runbook |
 | `docs/superpowers/plans/…` | new | **do not send** — internal plan |
 
@@ -67,7 +67,7 @@ Release as x.y.z.
 
 Plus, in the same commit:
 
-- `README.md`: new `## Teams` section + ToC entry; `## Dependencies` updated if `yaml` is added.
+- `README.md`: new `## Teams` section + ToC entry; `## Dependencies` still states the `ws`-only posture (no dependency is added).
 - `CHANGELOG.md`: new version section in upstream's prose style.
 - `package.json`: version bump.
 - `package-lock.json`: consistent lock.
@@ -107,7 +107,7 @@ Anticipate these, since they are the failure modes this feature is about:
 | Repo with no `.pi-link/` | `discover` reports artifacts, `Manifest: none`; `check` exits 1 with a clear message |
 | Manifest referencing a missing profile | `check` exits 1, names `roles.<x>.profile is missing: <path>` |
 | Manifest with no `hub.role` | `check` exits 1, `hub.role is required` |
-| Malformed YAML | clean `ERROR failed to read team manifest: …`, exit 1 — **no stack trace** |
+| Malformed JSON | clean `ERROR team manifest is not valid JSON: …`, exit 1 — **no stack trace** |
 | Relative paths in manifest | normalized against repo root |
 | Skills referenced but absent | required → error; optional → warning |
 | Duplicate terminal names | error |
@@ -119,8 +119,9 @@ These are covered by the branch's tests; each was also verified by hand against 
 - The `team` command block is dispatched on `rawArgs.indexOf("team") === 0`, so it captures any
   first argument equal to `team`. This is the collision in issue question 1 — disclose it, do
   not bury it.
-- A new runtime dependency is a posture change for a package whose README advertises one
-  runtime dependency. Disclose, and offer the JSON-only alternative.
+- **No** runtime dependency is added: the manifest is JSON, parsed with `JSON.parse`. The
+  README's `ws`-only posture is preserved. If upstream prefers YAML, that becomes a dependency
+  conversation, not a silent cost.
 - Discovery reads directory trees; it is strictly read-only and writes nothing. State this
   plainly, since the natural fear is a tool that mutates a repo.
 
@@ -141,7 +142,7 @@ proposal.
 1. **Now:** local gate works; runbook written; issue and this plan drafted (no sending).
 2. **You review** the issue draft and this plan.
 3. **File the issue** only if you approve — leading with the two design questions.
-4. **Await direction** on subcommand-vs-flag and YAML-vs-JSON.
+4. **Await direction** on subcommand-vs-flag (the format question is settled as JSON-only).
 5. **Reshape** the branch per that direction; add README/CHANGELOG/version per convention.
 6. **Re-verify** with the checklist above, including the packed-artifact check.
 7. **Open the PR** referencing the issue.

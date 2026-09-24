@@ -12,7 +12,7 @@ Use this skill when a user asks to discover, define, validate, or start a local 
 - Inspect before proposing changes.
 - Reuse existing `.omp/agents/`, `.agents/`, `.omp/skills/`, `skills/`, and `scripts/` artifacts.
 - Treat repository policy files such as `AGENTS.md`, handoff docs, and ownership records as authoritative project policy.
-- Treat `.pi-link/team.yml` as a composition manifest, not a replacement for role prompts or project policy.
+- Treat `.pi-link/team.json` as a composition manifest, not a replacement for role prompts or project policy.
 - Never overwrite an existing manifest, profile, skill, or launcher without explicit approval.
 - Group names scope normal pi-link visibility and routing; they are not authentication.
 - A declared coordinator/hub role is a startup convention until the runtime enforces it.
@@ -42,24 +42,21 @@ Ask only for information discovery cannot establish:
 
 ## Manifest rules
 
-Write `.pi-link/team.yml` only after the user confirms the proposal. Reference existing files instead of copying their contents:
+Write `.pi-link/team.json` only after the user confirms the proposal. Reference existing files instead of copying their contents:
 
-```yaml
-version: 1
-team:
-  name: project-name
-  group: project-name
-hub:
-  role: advisor
-  mode: designated
-roles:
-  advisor:
-    profile: .omp/agents/advisor.md
-    skills:
-      required: [team-workflow]
-    tools:
-      required: [read, link_list, link_send]
-      requestable: [browser]
+```json
+{
+  "version": 1,
+  "team": { "name": "project-name", "group": "project-name" },
+  "hub": { "role": "advisor", "mode": "designated" },
+  "roles": {
+    "advisor": {
+      "profile": ".omp/agents/advisor.md",
+      "skills": { "required": ["team-workflow"] },
+      "tools": { "required": ["read", "link_list", "link_send"], "requestable": ["browser"] }
+    }
+  }
+}
 ```
 
 After writing, run:
