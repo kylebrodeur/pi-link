@@ -273,7 +273,14 @@ if (teamIndex === 0) {
     console.error("Usage: pi-link team discover|show|check|explain");
     process.exit(64);
   }
-  const inventory = await discoverTeam(process.cwd());
+  let inventory;
+  try {
+    inventory = await discoverTeam(process.cwd());
+  } catch (error) {
+    // A malformed manifest is a user error, not a crash: report it and exit nonzero.
+    console.error(`ERROR failed to read team manifest: ${error.message}`);
+    process.exit(1);
+  }
   if (subcommand === "discover" || subcommand === "explain") console.log(formatTeamReport(inventory));
   if (subcommand === "show") {
     console.log(formatTeamReport(inventory));

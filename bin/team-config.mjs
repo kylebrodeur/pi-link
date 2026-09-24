@@ -139,8 +139,9 @@ export function validateTeamConfig(config, inventory) {
   if (!config?.team?.name) errors.push('team.name is required');
   if (!config?.team?.group) errors.push('team.group is required');
   if (!config?.roles || Object.keys(config.roles).length === 0) errors.push('roles must contain at least one role');
-  if (config?.hub?.mode === 'designated' && !config.roles?.[config.hub.role]) {
-    errors.push(`hub.role "${config?.hub?.role ?? ''}" does not name a configured role`);
+  if (!config?.hub?.role) errors.push('hub.role is required');
+  else if (!config.roles?.[config.hub.role]) {
+    errors.push(`hub.role "${config.hub.role}" does not name a configured role`);
   }
   const linkNames = new Map();
   for (const [name, role] of Object.entries(config?.roles ?? {})) {

@@ -108,6 +108,18 @@ test('reports missing required profile and hub role as validation errors', async
   ]);
 });
 
+test('requires a hub role even when no hub mode is declared', () => {
+  const result = validateTeamConfig({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    roles: {
+      worker: { role: 'member', profile: '/present.md' }
+    }
+  }, { existingPaths: new Set(['/present.md']), skillIds: new Set() });
+
+  assert.deepEqual(result.errors, ['hub.role is required']);
+});
+
 test('formats a concise discovery report', () => {
   const text = formatTeamReport({
     root: '/repo',
