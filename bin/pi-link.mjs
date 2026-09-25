@@ -17,7 +17,7 @@ import { createInterface } from "readline";
 import { join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
-import { discoverTeam, formatTeamReport, validateTeamConfig, buildTeamManifest, resolveLaunchPlan, formatLaunchPlan } from "./team-config.mjs";
+import { discoverTeam, formatTeamReport, validateTeamConfig, buildTeamManifest, resolveLaunchPlan, formatLaunchPlan, readKnownModels } from "./team-config.mjs";
 
 // Canonicalize a link/session name: trim + collapse internal whitespace.
 // Must match the extension's normalizeName (index.ts).
@@ -311,7 +311,7 @@ function printHelp() {
   console.error("       pi-link --team [--json]");
   console.error("       pi-link --team-check");
   console.error("       pi-link --team-init [--write] [--hub <role>] [--roles a,b] [--group <name>]");
-  console.error("       pi-link --team-run [--dry-run] [--roles a,b]");
+  console.error("       pi-link --team-run [--dry-run] [--roles a,b] [--harness omp|pi]");
   console.error("       pi-link --version");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
@@ -369,6 +369,10 @@ const state = {
   teamGroup: null,
   teamWrite: false,
   teamDryRun: false,
+  // Which CLI `--team-run` spawns. omp and pi disagree on flags, so this is
+  // explicit rather than guessed: a wrong guess produces "Unknown option" and
+  // the role never starts.
+  teamHarness: null,
 };
 
 function setMode(mode) {
@@ -467,6 +471,18 @@ for (let i = 0; i < rawArgs.length; i++) {
   }
   if (a === "--dry-run" && state.mode === "team-run") {
     state.teamDryRun = true;
+    continue;
+  }
+  if (a === "--harness" && state.mode === "team-run") {
+    const next = rawArgs[i + 1];
+    if (next === undefined || next.startsWith("-")) {
+      fail(`--harness requires a value: omp or pi.\n  Usage: pi-link --team-run [--dry-run] [--roles a,b] [--harness omp|pi]`);
+    }
+    if (next !== "omp" && next !== "pi") {
+      fail(`--harness must be omp or pi; got "${next}"`);
+    }
+    state.teamHarness = next;
+    i++;
     continue;
   }
   if (a.startsWith("--resolve=")) {
@@ -853,11 +869,44 @@ async function runTeamCheck() {
     skillIds: new Set(inventory.skills.map((skill) => skill.id)),
     skills: inventory.skills,
     profiles: inventory.profiles,
+    // The harness's own model registry, so a declared model that does not
+    // resolve is reported. Null when unavailable, which skips the check rather
+    // than inventing a list.
+    knownModels: await knownModels(),
   });
   for (const error of result.errors) console.error(`ERROR ${error}`);
   for (const warning of result.warnings) console.error(`WARN ${warning}`);
   if (result.errors.length) process.exit(1);
   console.log(`Team manifest valid: ${inventory.manifest.manifestPath}`);
+}
+
+// Models either harness reports, via `omp models --json` plus pi's enabled-model
+// settings. Cached for the process because validation is the only caller and the
+// commands are slow. Absent CLI, non-zero exit, or unparseable output all yield
+// null, which makes the model check skip rather than fail — the same
+// "unanswerable, so not answered wrongly" rule the rest of validation follows.
+//
+// The cache is a property of the function, not a module-level binding: this file
+// dispatches at the top before its later `let`/`const` bindings initialize, so a
+// module-level cache is in the temporal dead zone when `--team-check` runs.
+// The cache uses `var` deliberately: this file dispatches at the top of the
+// module and its later `let`/`const` bindings are still in the temporal dead
+// zone at that point, so a block-scoped cache throws "Cannot access before
+// initialization". `var` hoists as `undefined`, which the check below handles.
+var knownModelsCache;
+async function knownModels() {
+  if (knownModelsCache !== undefined) return knownModelsCache;
+  knownModelsCache = readKnownModels(
+    (cmd, args) => new Promise((resolve, reject) => {
+      const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "ignore"] });
+      let out = "";
+      child.stdout.on("data", (chunk) => { out += chunk; });
+      child.once("error", reject);
+      child.once("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`exit ${code}`))));
+    }),
+    (filePath) => readFile(filePath, "utf-8"),
+  );
+  return knownModelsCache;
 }
 
 // A malformed manifest is a user error, not a crash: report it and exit nonzero
@@ -911,7 +960,11 @@ async function runTeamInit(state) {
 // than decorative.
 async function runTeamRun(state) {
   const inventory = await loadTeamInventory();
-  const plan = await resolveLaunchPlan(inventory, { roles: state.teamRoles });
+  // Default to the harness this repo's profiles resolve against: an OMP-only
+  // repo (`.omp/agents` with no `.pi/agents`) launches omp, and vice versa. An
+  // explicit --harness always wins.
+  const harness = state.teamHarness ?? inferHarness(inventory);
+  const plan = await resolveLaunchPlan(inventory, { roles: state.teamRoles, harness });
 
   if (state.teamDryRun) {
     console.log(formatLaunchPlan(plan));
@@ -931,7 +984,8 @@ async function runTeamRun(state) {
   const children = [];
   for (const role of ordered) {
     // The prompt body is delivered through a file so a long prompt never has to
-    // survive shell quoting, and so `omp --system-prompt @file` reads it whole.
+    // survive shell quoting, and so `<harness> --system-prompt @file` reads it
+    // whole.
     //
     // It is written whenever a prompt exists, not only when the role declares a
     // sessionDir: a manifest that omits sessionDir would otherwise launch the
@@ -947,21 +1001,48 @@ async function runTeamRun(state) {
     }
     const argv = [...role.argv];
     if (promptFile) argv.push("--system-prompt", `@${promptFile}`);
-    console.error(`Launching ${role.linkName}${role.isHub ? " [hub]" : ""} — ${role.cwd}`);
-    children.push(spawn("omp", argv, { stdio: "inherit", cwd: role.cwd }));
+
+    // Both harnesses take the link name through the extension's env handoff, but
+    // omp also has a real `--link-name` flag, so it gets both. pi has only the
+    // env var, and reaches its directory through the spawn cwd (it has no
+    // `--cwd`).
+    const env = { ...process.env, PI_LINK_NAME: role.linkName };
+    if (state.piPassthrough.length) argv.push(...state.piPassthrough);
+
+    console.error(`Launching ${role.linkName}${role.isHub ? " [hub]" : ""} via ${harness} — ${role.cwd}`);
+    children.push(spawn(harness, argv, { stdio: "inherit", cwd: role.cwd, env }));
   }
 
   // One role exiting is not a reason to tear down the rest of the team, but the
-  // wrapper has to stay alive or the terminals lose their parent.
+  // wrapper has to stay alive or the terminals lose their parent. The first
+  // non-zero exit becomes the wrapper's exit code: a launcher that reports
+  // success when every role failed to start is worse than no launcher at all.
   let remaining = children.length;
+  let firstFailure = null;
   for (const child of children) {
-    child.once("exit", () => { remaining -= 1; if (remaining === 0) process.exit(0); });
+    child.once("exit", (code, signal) => {
+      if (code !== 0 && firstFailure === null) firstFailure = code ?? (signal ? 1 : 0);
+      remaining -= 1;
+      if (remaining === 0) process.exit(firstFailure ?? 0);
+    });
     child.once("error", (err) => {
       console.error(`Failed to launch: ${err.message}`);
+      if (firstFailure === null) firstFailure = 1;
       remaining -= 1;
-      if (remaining === 0) process.exit(1);
+      if (remaining === 0) process.exit(firstFailure);
     });
   }
+}
+
+// Which harness this repo's team targets. A profile root is the evidence: a repo
+// whose profiles live only under `.pi/agents` is a Pi team, one under
+// `.omp/agents` is an OMP team. OMP is the default when both or neither are
+// present, because pi-link's own CLI surface (`--link-name`, `--cwd`) is built
+// for it.
+function inferHarness(inventory) {
+  const harnesses = new Set((inventory.profiles ?? []).map((profile) => profile.harness).filter(Boolean));
+  if (harnesses.size === 1) return [...harnesses][0];
+  return "omp";
 }
 
 async function runLauncher(state) {

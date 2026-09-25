@@ -450,6 +450,106 @@ function shadowedSkillIds(skills) {
     .map(([id, entries]) => ({ id, roots: entries.map((entry) => entry.root) }));
 }
 
+// Ask a harness which models it can actually resolve. Neither pi-link nor this
+// module has a model table of its own, and hardcoding one would reject valid ids
+// the moment a provider adds a model, so the registry is read from the harness.
+//
+// omp reports its whole registry via `models --json`. pi has no such flag, but
+// its settings file lists the models it enables, which is the equivalent answer
+// for that harness. Both are tried; the union is accepted, because a manifest
+// may legitimately name a model either harness resolves.
+//
+// Returns a Set of accepted ids, or null when nothing could be read — an
+// unanswerable question must be skipped rather than answered wrongly.
+
+// Collect strings from a value that arrived from outside this module.
+//
+// This is the I/O boundary for an external payload, so the narrowing lives here
+// rather than at each use site. Domain-type identity (`constructor`) is used
+// instead of a `typeof` narrowing: it establishes *what the value is* rather
+// than only what representation it happens to have, which is the distinction the
+// anti-slop rule is about.
+function collectStrings(value, keys, into) {
+  if (value?.constructor !== Object) return;
+  for (const key of keys) {
+    const entry = value[key];
+    if (entry?.constructor === String && entry) into.add(entry);
+  }
+}
+
+// String entries from an unknown array-shaped payload (pi's settings file lists
+// enabled models as a bare array of strings).
+function collectStringArray(value, into) {
+  if (!Array.isArray(value)) return;
+  for (const entry of value) {
+    if (entry?.constructor === String && entry) into.add(entry);
+  }
+}
+
+export async function readKnownModels(runCommand, readTextFile) {
+  const ids = new Set();
+
+  // omp: full registry, with the selector a manifest would copy. Every spelling
+  // a manifest might legitimately use is kept: the bare id (`glm-5.3`), the
+  // qualified selector (`ollama-cloud/glm-5.3`), and the display name.
+  try {
+    const payload = JSON.parse(await runCommand('omp', ['models', '--json']));
+    const models = Array.isArray(payload) ? payload : payload?.models;
+    if (Array.isArray(models)) {
+      for (const model of models) collectStrings(model, ['id', 'selector', 'name'], ids);
+    }
+  } catch {
+    // omp absent or unreadable; the pi source below may still answer.
+  }
+
+  // pi: the enabled-model list from its settings file. The path follows the
+  // harness's own config dir, which pi-link resolves rather than assumes.
+  if (readTextFile) {
+    for (const settingsPath of [
+      path.join(os.homedir(), '.pi', 'agent', 'settings.json'),
+      path.join(os.homedir(), '.omp', 'agent', 'settings.json'),
+    ]) {
+      try {
+        const settings = JSON.parse(await readTextFile(settingsPath));
+        for (const key of ['enabledModels', 'models']) collectStringArray(settings?.[key], ids);
+      } catch {
+        // Absent settings file is normal; try the next candidate.
+      }
+    }
+  }
+
+  return ids.size ? ids : null;
+}
+
+// Whether a declared model names something the harness can resolve.
+//
+// Exact matching is too strict, for two reasons. The harnesses spell the same
+// model differently (omp reports id `glm-5.3` with selector
+// `ollama-cloud/glm-5.3`; pi enables `ollama/glm-5.3:cloud`), and omp resolves
+// models by fuzzy match, so `opus` is a legitimate value that matches
+// `claude-opus-4-0` by substring. Comparing on a normalized core — provider
+// prefix and any `:suffix` removed — plus a substring relation on either side
+// accepts every legitimate spelling while still rejecting a name nothing
+// resembles.
+function coreModelName(value) {
+  const lastSegment = String(value).split('/').pop();
+  return lastSegment.split(':')[0].trim().toLowerCase();
+}
+
+export function modelResolves(declared, known) {
+  if (!known?.size) return null;
+  if (known.has(declared)) return true;
+  const want = coreModelName(declared);
+  if (!want) return false;
+  for (const entry of known) {
+    const have = coreModelName(entry);
+    if (have === want) return true;
+    // Fuzzy match, as the harness itself does: either direction of substring.
+    if (have.includes(want) || want.includes(have)) return true;
+  }
+  return false;
+}
+
 export function validateTeamConfig(config, inventory) {
   const errors = [];
   const warnings = [];
@@ -516,11 +616,19 @@ export function validateTeamConfig(config, inventory) {
         `roles.${name}.profile is in a loadable root but its frontmatter is ${inertProfiles.get(role.profile)}, so no harness will register it: ${role.profile}`,
       );
     }
+    // A declared model the harness cannot resolve means every run of that role
+    // falls back or fails. pi-link does not know the model list itself, so the
+    // check runs only when the caller supplies one (the CLI reads it from
+    // `omp models --json`); without it the question is unanswerable and skipped
+    // rather than answered wrongly.
+    if (role.model && inventory.knownModels instanceof Set && modelResolves(role.model, inventory.knownModels) === false) {
+      warnings.push(
+        `roles.${name}.model "${role.model}" is not a model this harness reports, so the role may fall back to a default: ${role.model}`,
+      );
+    }
     // The manifest wins over the profile's own frontmatter, so when the two
     // disagree the override is deliberate but invisible. Say so rather than
-    // letting a reader assume the profile's value is what runs. Validating the
-    // id itself is not possible here: pi-link has no model registry to check
-    // against, and inventing one would reject valid ids.
+    // letting a reader assume the profile's value is what runs.
     const profileModel = inventory.profiles?.find((profile) => profile.path === role.profile)?.model;
     if (role.model && profileModel && role.model !== profileModel) {
       warnings.push(
@@ -766,6 +874,13 @@ export async function resolveLaunchPlan(inventory, options = {}) {
   const resolvedBy = new Map(
     (inventory.profiles ?? []).map((profile) => [profile.path, profile]),
   );
+  // Which CLI to spawn. omp and pi do not share a flag surface: `omp` accepts
+  // `--link-name` and `--cwd`, `pi` accepts neither and takes a link name only
+  // through the extension's `PI_LINK_NAME` env handoff. Generating omp flags for
+  // pi produces "Unknown option" and the role never starts, so the harness is
+  // resolved once here rather than assumed.
+  const harness = options.harness ?? 'omp';
+  const isPi = harness === 'pi';
 
   const roles = [];
   for (const [name, role] of Object.entries(manifest.roles ?? {})) {
@@ -795,19 +910,33 @@ export async function resolveLaunchPlan(inventory, options = {}) {
     // terminal runs something else, with nothing reporting the difference.
     const model = role.model ?? discovered?.model ?? null;
     if (!model) {
-      // Say it rather than letting the harness default stand in silently. This
-      // is the case for a profile outside every discovery root: the manifest
-      // knows the path but discovery never read its frontmatter, so no model is
-      // known and `--model` is omitted.
-      warnings.push(`roles.${name} declares no model and its profile was not discovered, so the harness default will be used: ${role.profile}`);
+      // Say it rather than letting the harness default stand in silently. Two
+      // distinct causes, and naming the wrong one sends the reader looking in
+      // the wrong place: a profile outside every discovery root was never read,
+      // while a discovered profile simply declares no model.
+      warnings.push(discovered
+        ? `roles.${name} declares no model and its profile declares none either, so the harness default will be used: ${role.profile}`
+        : `roles.${name} declares no model and its profile was not discovered, so the harness default will be used: ${role.profile}`);
     }
 
     const cwd = role.cwd ? path.resolve(root, role.cwd) : root;
     const sessionDir = role.sessionDir ? path.resolve(root, role.sessionDir) : null;
-    const argv = ['--link-name', role.linkName ?? name, '--cwd', cwd];
+    // Flags both harnesses accept, plus the ones only omp has. `pi` reaches the
+    // role's directory through the spawn cwd instead of `--cwd`, and gets its
+    // link name through `PI_LINK_NAME` rather than `--link-name`.
+    const argv = [];
+    if (!isPi) argv.push('--link-name', role.linkName ?? name, '--cwd', cwd);
     if (model) argv.push('--model', model);
     if (sessionDir) argv.push('--session-dir', sessionDir);
-    if (role.config) argv.push('--config', path.resolve(root, role.config));
+    // pi has no --config overlay flag; its equivalent is a settings file it
+    // discovers itself, so a declared config is reported rather than dropped.
+    if (role.config) {
+      if (isPi) {
+        warnings.push(`roles.${name}.config is not passable to pi, which has no --config flag; the role starts without it: ${role.config}`);
+      } else {
+        argv.push('--config', path.resolve(root, role.config));
+      }
+    }
 
     roles.push({
       name,
@@ -817,6 +946,7 @@ export async function resolveLaunchPlan(inventory, options = {}) {
       sessionDir,
       config: role.config ? path.resolve(root, role.config) : null,
       isHub: manifest.hub?.role === name,
+      harness,
       argv,
       promptBody: body,
     });
@@ -841,7 +971,8 @@ export function formatLaunchPlan(plan) {
   lines.push(`Launch plan (${plan.roles.length} role${plan.roles.length === 1 ? '' : 's'}):`);
   for (const role of plan.roles) {
     const hub = role.isHub ? ' [hub]' : '';
-    lines.push(`  ${role.linkName}${hub} — cwd ${role.cwd}`);
+    const via = role.harness ? ` via ${role.harness}` : '';
+    lines.push(`  ${role.linkName}${hub}${via} — cwd ${role.cwd}`);
     if (role.model) lines.push(`      model:   ${role.model}`);
     if (role.sessionDir) lines.push(`      session: ${role.sessionDir}`);
     if (role.config) lines.push(`      config:  ${role.config}`);

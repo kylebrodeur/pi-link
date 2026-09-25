@@ -847,3 +847,94 @@ test('validation reports a manifest model that overrides the profile', async () 
   assert.deepEqual(absent.errors, []);
   assert.deepEqual(absent.warnings, []);
 });
+
+// ─── Model resolution ────────────────────────────────────────────────────────
+
+// The harnesses spell one model several ways, and omp resolves models by fuzzy
+// match. Exact-set membership would reject every one of these.
+test('modelResolves accepts every legitimate spelling of a model', async () => {
+  const { modelResolves } = await import('../bin/team-config.mjs');
+  const known = new Set(['glm-5.3', 'ollama-cloud/glm-5.3', 'GLM-5.3', 'ollama/glm-5.3:cloud']);
+
+  for (const declared of ['glm-5.3', 'ollama/glm-5.3', 'ollama/glm-5.3:cloud', 'ollama-cloud/glm-5.3']) {
+    assert.equal(modelResolves(declared, known), true, `${declared} should resolve`);
+  }
+  // Fuzzy, as the harness itself matches: a bare family name is legitimate.
+  assert.equal(modelResolves('glm', known), true);
+  // A name nothing resembles is rejected.
+  assert.equal(modelResolves('totally-bogus-xyz', known), false);
+  // No registry means the question is unanswerable, not false.
+  assert.equal(modelResolves('glm-5.3', null), null);
+  assert.equal(modelResolves('glm-5.3', new Set()), null);
+});
+
+// The registry is read from the harnesses: omp's full model list, plus pi's
+// enabled models from its settings file. Neither is hardcoded here.
+test('readKnownModels unions the harness registries and tolerates absence', async () => {
+  const { readKnownModels } = await import('../bin/team-config.mjs');
+
+  const runCommand = async (cmd, args) => {
+    assert.equal(cmd, 'omp');
+    assert.deepEqual(args, ['models', '--json']);
+    return JSON.stringify({ models: [{ id: 'glm-5.3', selector: 'ollama-cloud/glm-5.3', name: 'GLM-5.3' }] });
+  };
+  const readTextFile = async (p) => {
+    if (!p.includes('.pi')) throw new Error('ENOENT');
+    return JSON.stringify({ enabledModels: ['ollama/kimi-k2.7-code:cloud'] });
+  };
+
+  const known = await readKnownModels(runCommand, readTextFile);
+  assert.ok(known.has('glm-5.3'));
+  assert.ok(known.has('ollama-cloud/glm-5.3'));
+  assert.ok(known.has('GLM-5.3'));
+  assert.ok(known.has('ollama/kimi-k2.7-code:cloud'));
+
+  // Both sources unavailable yields null, so validation skips the check rather
+  // than rejecting every model.
+  const none = await readKnownModels(
+    async () => { throw new Error('omp not found'); },
+    async () => { throw new Error('ENOENT'); },
+  );
+  assert.equal(none, null);
+});
+
+// ─── Harness-aware launching ─────────────────────────────────────────────────
+
+// omp and pi do not share a flag surface. pi rejects `--link-name`, `--cwd` and
+// `--config`, so generating omp flags for it means the role never starts.
+test('a pi launch omits the flags pi rejects, and an omp launch keeps them', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\ndescription: d\nmodel: glm-5.3\nlinkName: advisor\n---\nbody\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'advisor' },
+    roles: { advisor: { profile: '.omp/agents/advisor.md', config: 'x.yml', sessionDir: 's' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+
+  const omp = await resolveLaunchPlan(inventory, { harness: 'omp' });
+  assert.ok(omp.roles[0].argv.includes('--link-name'));
+  assert.ok(omp.roles[0].argv.includes('--cwd'));
+  assert.ok(omp.roles[0].argv.includes('--config'));
+  assert.deepEqual(omp.warnings.filter((w) => /passable to pi/.test(w)), []);
+
+  const pi = await resolveLaunchPlan(inventory, { harness: 'pi' });
+  // pi has none of these; it reaches its directory through the spawn cwd and its
+  // link name through the extension's env handoff instead.
+  assert.equal(pi.roles[0].argv.includes('--link-name'), false);
+  assert.equal(pi.roles[0].argv.includes('--cwd'), false);
+  assert.equal(pi.roles[0].argv.includes('--config'), false);
+  // Flags both accept are still passed.
+  assert.ok(pi.roles[0].argv.includes('--model'));
+  assert.ok(pi.roles[0].argv.includes('--session-dir'));
+  // A declared config pi cannot take is reported, not silently dropped.
+  assert.match(pi.warnings.join('\n'), /not passable to pi/);
+  assert.equal(pi.roles[0].harness, 'pi');
+});
