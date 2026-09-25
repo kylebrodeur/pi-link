@@ -55,9 +55,13 @@ test('a declared profile outside every harness root validates, and warns it will
   }));
 
   const inventory = await discoverTeam(root);
-  // Discovery does not treat it as a discoverable profile...
-  assert.deepEqual(inventory.profiles, []);
-  // ...so validation passes (the file exists) but says OMP will not resolve it.
+  // Discovery now surfaces it as a `declared` profile — read back from the
+  // manifest because no discovery root contains it. Without this, rebuilding a
+  // manifest would silently drop the role.
+  assert.deepEqual(inventory.profiles.map((p) => p.id), ['pen-porter']);
+  assert.equal(inventory.profiles[0].source, 'declared');
+  assert.equal(inventory.profiles[0].root, null);
+  // It is still not OMP-resolvable, and validation says so.
   const result = validateTeamConfig(inventory.manifest, {
     existingPaths: inventory.existingPaths,
     existingDirs: inventory.existingDirs,
@@ -69,6 +73,64 @@ test('a declared profile outside every harness root validates, and warns it will
   assert.equal(result.warnings.length, 1);
   assert.match(result.warnings[0], /outside every harness's agent roots/);
   assert.match(result.warnings[0], /a launcher can still pass it by path/);
+});
+
+// Rebuilding a manifest must be faithful: a role whose profile sits outside the
+// discovery roots, and the launch facts only the manifest knows, both survive.
+// Dropping them would make `--team-init` shrink a working team.
+test('rebuilding a manifest preserves an out-of-root role and its launch facts', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'plantfluent-agents', 'pen-porter.md'),
+    '# Pen porter\n\nOwn the conversion lane.\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'pen-porter' },
+    roles: {
+      'pen-porter': {
+        profile: '.omp/plantfluent-agents/pen-porter.md',
+        role: 'Pen Porter / Storybook',
+        cwd: '.',
+        sessionDir: '.omp/plantfluent-agents/pen-porter',
+        config: '.omp/light-session.yml',
+      }
+    }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const { manifest } = buildTeamManifest(inventory, { hub: 'pen-porter' });
+  const role = manifest.roles['pen-porter'];
+  assert.ok(role, 'the out-of-root role must survive a rebuild');
+  assert.equal(role.profile, '.omp/plantfluent-agents/pen-porter.md');
+  assert.equal(role.role, 'Pen Porter / Storybook');
+  // Repo-relative, not the absolute paths loadTeamConfig resolves on read — a
+  // committed manifest must work on another machine.
+  assert.equal(role.cwd, '.');
+  assert.equal(role.sessionDir, '.omp/plantfluent-agents/pen-porter');
+  assert.equal(role.config, '.omp/light-session.yml');
+  assert.equal(manifest.hub.role, 'pen-porter');
+});
+
+// A profile with no frontmatter at all is still a launchable role: it is a plain
+// markdown brief. It cannot register as a subagent, and that is reported, but it
+// must not be dropped from discovery or from a rebuild.
+test('a frontmatter-less profile is kept and reported as inert', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'brief.md'), '# Role brief\n\nDo the work.\n');
+
+  const inventory = await discoverTeam(root);
+  assert.deepEqual(inventory.profiles.map((p) => p.id), ['brief']);
+  assert.equal(inventory.profiles[0].loadable, false);
+  assert.equal(inventory.profiles[0].notLoadableBecause, 'missing name and description');
+
+  const { manifest, notes } = buildTeamManifest(inventory);
+  assert.deepEqual(Object.keys(manifest.roles), ['brief']);
+  assert.match(notes.join('\n'), /brief.*inert as a subagent/s);
 });
 
 test('a profile under a real OMP root does not warn', async () => {

@@ -266,12 +266,18 @@ export async function loadTeamConfig(root) {
 async function readProfile(filePath, origin) {
   const frontmatter = parseFrontmatter(await fs.readFile(filePath, 'utf8'));
   const fallbackId = path.basename(filePath).replace(/\.agent\.md$|\.md$/, '');
+  // A profile with no frontmatter at all (a plain markdown role brief) is a real
+  // case: it still launches via --system-prompt, so it must not be dropped just
+  // because it declares nothing. It has no name or description, which is the
+  // same shape as an inert profile, so it is reported the same way.
   const loadable = Boolean(frontmatter.name && frontmatter.description);
   const profile = {
     ...origin,
-    id: frontmatter.name ?? fallbackId,
+    // A declared role's own name wins: the manifest is what the team calls it,
+    // and the filename is only a fallback for a conventionally found profile.
+    id: origin.declaredName ?? frontmatter.name ?? fallbackId,
     role: frontmatter.role ?? frontmatter.type ?? frontmatter.description ?? null,
-    model: frontmatter.model ?? null,
+    model: origin.declaredModel ?? frontmatter.model ?? null,
     skills: toStringList(frontmatter.autoloadSkills),
     // The terminal name a profile asks to be known by. A team calls this role
     // "advisor" even when the profile file is `plantfluent-advisor.md`, so it is
@@ -316,6 +322,33 @@ export async function discoverTeam(root) {
         legacy: rootSpec.legacy ?? false,
       }));
     }
+  }
+
+  // A manifest may declare a profile outside every discovery root — a role file
+  // kept beside its own session dir, which is legitimate (a launcher reads it by
+  // path). Those roles are invisible to the scans above, so reading the manifest
+  // back is the only way `--team-init` can rebuild the team it declared instead
+  // of silently producing a manifest missing them. Labelled `declared` so a
+  // report never presents them as conventionally discoverable.
+  const priorManifest = await loadTeamConfig(root);
+  const knownPaths = new Set(profiles.map((profile) => profile.path));
+  for (const [name, role] of Object.entries(priorManifest?.roles ?? {})) {
+    if (!role.profile) continue;
+    const profilePath = path.resolve(root, role.profile);
+    if (knownPaths.has(profilePath)) continue;
+    if (!(await exists(profilePath))) continue;
+    knownPaths.add(profilePath);
+    profiles.push(await readProfile(profilePath, {
+      path: profilePath,
+      root: null,
+      source: 'declared',
+      harness: null,
+      legacy: false,
+      declaredName: name,
+      // The manifest's own fields win for a declared role: `--team-run` reads
+      // them, and they are what the team already agreed.
+      declaredModel: role.model ?? null,
+    }));
   }
 
   // `root` is recorded so a report can tell a tracked source skill from a local
@@ -445,10 +478,12 @@ export function validateTeamConfig(config, inventory) {
   const linkDirs = new Map();
   // Profile paths each harness would actually resolve. "Resolvable" is a
   // question about one harness, not about the filesystem: `.omp/agents` is
-  // OMP-only, `.pi/agents` and `.agents` are Pi-only. A declared profile outside
-  // every root is not loaded by either as an agent definition; a launcher may
-  // still read it (by path, as `--system-prompt`), so this is a warning rather
-  // than an error — but it must not look like a normal team member.
+  // OMP-only, `.pi/agents` and `.agents` are Pi-only. A profile with a null
+  // harness belongs to no discovery root at all (it was read back from the
+  // manifest because it lives outside every one), so neither harness loads it as
+  // an agent definition; a launcher may still read it (by path, as
+  // `--system-prompt`), so this is a warning rather than an error — but it must
+  // not look like a normal team member.
   //
   // Tolerate a caller that supplies only file paths: without a discovery result
   // the question is unanswerable, so it is skipped rather than answered wrongly.
@@ -469,7 +504,10 @@ export function validateTeamConfig(config, inventory) {
   for (const [name, role] of Object.entries(config?.roles ?? {})) {
     if (!role.profile) errors.push(`roles.${name}.profile is required`);
     else if (!inventory.existingPaths.has(role.profile)) errors.push(`roles.${name}.profile is missing: ${role.profile}`);
-    else if (resolvableBy && !resolvableBy.has(role.profile)) {
+    else if (resolvableBy && !resolvableBy.get(role.profile)) {
+      // `.has` is not enough: a discovered-but-out-of-root profile is present
+      // with a null harness, and neither harness loads it as an agent
+      // definition. Only a truthy harness means it would resolve.
       warnings.push(
         `roles.${name}.profile is outside every harness's agent roots, so it will not load as a subagent (a launcher can still pass it by path): ${role.profile}`,
       );
@@ -575,6 +613,16 @@ export function profilePromptBody(content) {
   return content;
 }
 
+// A manifest is committed, so its paths must be repo-relative. `loadTeamConfig`
+// resolves declared paths against the repo root on read, which is right for
+// validating them but wrong to write back: an absolute path only works on the
+// machine that produced it. Convert back, and leave a path that genuinely sits
+// outside the repo absolute rather than inventing `../..` chains.
+function relativize(root, absolute) {
+  const relative = path.relative(root, absolute).split(path.sep).join('/');
+  return relative.startsWith('..') ? absolute : (relative || '.');
+}
+
 // Build a manifest from discovery. This is a scaffold, not a guesser: every
 // `profile` comes from a discovered path, and anything discovery cannot know —
 // cwd, sessionDir, config — is omitted rather than invented. `--team-check`
@@ -598,7 +646,9 @@ export function buildTeamManifest(inventory, options = {}) {
 
   // Project profiles only: a user-level profile is machine-local, so writing its
   // absolute path into a committed manifest would break for every other clone.
-  const candidates = (inventory.profiles ?? []).filter((profile) => profile.source === 'project');
+  // `declared` profiles come from the manifest being rebuilt, so they stay.
+  const candidates = (inventory.profiles ?? [])
+    .filter((profile) => profile.source === 'project' || profile.source === 'declared');
   // A role is keyed by the name the team actually calls it — the profile's
   // declared `linkName` when present, else its id. A repo whose files are
   // `plantfluent-advisor.md` still has a role called `advisor`, and the manifest
@@ -617,25 +667,42 @@ export function buildTeamManifest(inventory, options = {}) {
     if (profile.loadable === false) {
       notes.push(`"${roleName(profile)}" is inert as a subagent (${profile.notLoadableBecause}); it still launches via --system-prompt`);
     }
+    // A role the previous manifest declared is carried through under its own
+    // name, even when its profile sits outside every discovery root. Dropping it
+    // would make rebuilding a manifest silently shrink the team.
+    if (profile.source === 'declared' && profile.root === null) {
+      notes.push(`"${roleName(profile)}" is declared but sits outside the discovery roots; kept from the existing manifest`);
+    }
   }
 
   const teamName = name ?? path.basename(root);
+  const declaredRoles = inventory.manifest?.roles ?? {};
   const roles = {};
   for (const profile of selected) {
     const key = roleName(profile);
+    // A role the existing manifest declared is carried through unchanged where
+    // it has no discovery-visible source: its `cwd`, `sessionDir` and `config`
+    // are real launch facts the manifest already agreed, and rebuilding must not
+    // discard them. Discovery cannot know these values, so losing them would
+    // degrade a working manifest into a scaffold.
+    const prior = profile.source === 'declared' ? declaredRoles[key] : null;
     const entry = {
       profile: path.relative(root, profile.path).split(path.sep).join('/'),
       // Recorded explicitly rather than left implicit in the key: a launcher
       // reads this field, and `--link-name` must not silently follow a rename.
-      linkName: key,
+      linkName: prior?.linkName ?? key,
     };
-    if (profile.role) entry.role = profile.role;
+    if (prior?.role ?? profile.role) entry.role = prior?.role ?? profile.role;
     // Recorded so `--team-run` can pass `--model` and the manifest is complete
     // for launching. Without it a role's model lives only in frontmatter, and a
     // launcher reading the manifest would run the default instead.
     if (profile.model) entry.model = profile.model;
     if (profile.skills?.length) entry.skills = { required: [...profile.skills] };
-    roles[key] = entry;
+    if (prior?.cwd) entry.cwd = relativize(root, prior.cwd);
+    if (prior?.sessionDir) entry.sessionDir = relativize(root, prior.sessionDir);
+    if (prior?.config) entry.config = relativize(root, prior.config);
+    if (prior?.tools) entry.tools = prior.tools;
+    roles[prior?.linkName ?? key] = entry;
   }
 
   // Hub: explicit wins. Otherwise propose only a single unambiguous candidate.
