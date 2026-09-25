@@ -748,3 +748,102 @@ test('launch plan warns when no model is known for a role', async () => {
   const known = plan.roles.find((role) => role.name === 'known');
   assert.equal(known.model, 'glm-5.3');
 });
+
+// The manifest is the primary driver, so a model it declares must survive a
+// rebuild. Overwriting it with the profile's frontmatter would silently revert
+// an intentional override, and the manifest would stop being authoritative.
+test('rebuilding a manifest keeps the model the manifest declared', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\ndescription: d\nmodel: glm-5.3\nlinkName: advisor\n---\nbody\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'advisor' },
+    // An intentional override of the profile's model.
+    roles: { advisor: { profile: '.omp/agents/advisor.md', model: 'kimi-k3:cloud' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const { manifest } = buildTeamManifest(inventory, { hub: 'advisor' });
+  assert.equal(manifest.roles.advisor.model, 'kimi-k3:cloud');
+
+  // And the launch honours the same value, so read and write agree.
+  const plan = await resolveLaunchPlan(inventory);
+  assert.equal(plan.roles[0].model, 'kimi-k3:cloud');
+});
+
+// With no model in the manifest, discovery's value is what gets recorded.
+test('rebuilding falls back to the profile model when the manifest has none', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\ndescription: d\nmodel: glm-5.3\nlinkName: advisor\n---\nbody\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'advisor' },
+    roles: { advisor: { profile: '.omp/agents/advisor.md' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const { manifest } = buildTeamManifest(inventory, { hub: 'advisor' });
+  assert.equal(manifest.roles.advisor.model, 'glm-5.3');
+});
+
+// The manifest wins over the profile's frontmatter, so a disagreement is
+// deliberate but otherwise invisible. Report it, and stay silent when the two
+// agree so the warning keeps meaning.
+test('validation reports a manifest model that overrides the profile', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\ndescription: d\nmodel: glm-5.3\nlinkName: advisor\n---\nbody\n',
+  );
+  const manifest = (model) => {
+    const role = { profile: '.omp/agents/advisor.md' };
+    if (model) role.model = model;
+    return JSON.stringify({
+      version: 1,
+      team: { name: 'demo', group: 'demo' },
+      hub: { role: 'advisor' },
+      roles: { advisor: role }
+    });
+  };
+
+  const write = async (model) => {
+    await fs.writeFile(path.join(root, '.pi-link', 'team.json'), manifest(model));
+    const inventory = await discoverTeam(root);
+    return validateTeamConfig(inventory.manifest, {
+      existingPaths: inventory.existingPaths,
+      existingDirs: inventory.existingDirs,
+      skillIds: new Set(),
+      skills: [],
+      profiles: inventory.profiles,
+    });
+  };
+
+  const overriding = await write('kimi-k3:cloud');
+  assert.deepEqual(overriding.errors, []);
+  assert.equal(overriding.warnings.length, 1);
+  assert.match(overriding.warnings[0], /overrides the profile's declared "glm-5.3"/);
+
+  // Agreement is not news.
+  const agreeing = await write('glm-5.3');
+  assert.deepEqual(agreeing.errors, []);
+  assert.deepEqual(agreeing.warnings, []);
+
+  // No manifest model at all is also silent: the profile's value applies.
+  const absent = await write(null);
+  assert.deepEqual(absent.errors, []);
+  assert.deepEqual(absent.warnings, []);
+});

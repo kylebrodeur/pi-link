@@ -516,6 +516,17 @@ export function validateTeamConfig(config, inventory) {
         `roles.${name}.profile is in a loadable root but its frontmatter is ${inertProfiles.get(role.profile)}, so no harness will register it: ${role.profile}`,
       );
     }
+    // The manifest wins over the profile's own frontmatter, so when the two
+    // disagree the override is deliberate but invisible. Say so rather than
+    // letting a reader assume the profile's value is what runs. Validating the
+    // id itself is not possible here: pi-link has no model registry to check
+    // against, and inventing one would reject valid ids.
+    const profileModel = inventory.profiles?.find((profile) => profile.path === role.profile)?.model;
+    if (role.model && profileModel && role.model !== profileModel) {
+      warnings.push(
+        `roles.${name}.model "${role.model}" overrides the profile's declared "${profileModel}", so the manifest value is what launches`,
+      );
+    }
     // Optional launch facts: when declared, they must exist. A role that points
     // at a directory the launcher will not create is the failure this catches.
     for (const key of ['prompt', 'config']) {
@@ -681,11 +692,10 @@ export function buildTeamManifest(inventory, options = {}) {
   for (const profile of selected) {
     const key = roleName(profile);
     // A role the existing manifest declared is carried through unchanged where
-    // it has no discovery-visible source: its `cwd`, `sessionDir` and `config`
-    // are real launch facts the manifest already agreed, and rebuilding must not
-    // discard them. Discovery cannot know these values, so losing them would
-    // degrade a working manifest into a scaffold.
-    const prior = profile.source === 'declared' ? declaredRoles[key] : null;
+    // it has no discovery-visible source. Its launch facts are things the
+    // manifest already agreed and discovery cannot re-derive, so losing them
+    // would degrade a working manifest into a scaffold.
+    const prior = declaredRoles[key] ?? null;
     const entry = {
       profile: path.relative(root, profile.path).split(path.sep).join('/'),
       // Recorded explicitly rather than left implicit in the key: a launcher
@@ -693,11 +703,14 @@ export function buildTeamManifest(inventory, options = {}) {
       linkName: prior?.linkName ?? key,
     };
     if (prior?.role ?? profile.role) entry.role = prior?.role ?? profile.role;
-    // Recorded so `--team-run` can pass `--model` and the manifest is complete
-    // for launching. Without it a role's model lives only in frontmatter, and a
-    // launcher reading the manifest would run the default instead.
-    if (profile.model) entry.model = profile.model;
-    if (profile.skills?.length) entry.skills = { required: [...profile.skills] };
+    // The manifest is the primary driver, so a model it already declares wins
+    // over the profile's frontmatter — otherwise rebuilding silently reverts an
+    // intentional override. Falls back to discovery when the manifest has none.
+    const model = prior?.model ?? profile.model;
+    if (model) entry.model = model;
+    if (prior?.skills ?? profile.skills?.length) {
+      entry.skills = prior?.skills ?? { required: [...profile.skills] };
+    }
     if (prior?.cwd) entry.cwd = relativize(root, prior.cwd);
     if (prior?.sessionDir) entry.sessionDir = relativize(root, prior.sessionDir);
     if (prior?.config) entry.config = relativize(root, prior.config);
