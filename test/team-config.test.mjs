@@ -600,3 +600,89 @@ test('formatLaunchPlan names the hub and each prompt size', () => {
   assert.match(text, /advisor \[hub\]/);
   assert.match(text, /prompt: {2}10 bytes/);
 });
+
+// A role's model must reach the launch. Without it a role silently runs on the
+// harness default while its profile says otherwise, and nothing reports the gap.
+test('launch plan passes the model from the manifest, then from the profile', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'from-profile.md'),
+    '---\nname: from-profile\ndescription: d\nmodel: glm-5.3\n---\nbody\n',
+  );
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'from-manifest.md'),
+    '---\nname: from-manifest\ndescription: d\nmodel: glm-5.3\n---\nbody\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'from-profile' },
+    roles: {
+      'from-profile': { profile: '.omp/agents/from-profile.md' },
+      // An explicit model wins over the profile's, so a manifest can override.
+      'from-manifest': { profile: '.omp/agents/from-manifest.md', model: 'kimi-k2.7-code' },
+    }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const plan = await resolveLaunchPlan(inventory);
+  const byName = new Map(plan.roles.map((role) => [role.name, role]));
+  assert.equal(byName.get('from-profile').model, 'glm-5.3');
+  assert.equal(byName.get('from-manifest').model, 'kimi-k2.7-code');
+  assert.ok(byName.get('from-profile').argv.includes('--model'));
+  assert.equal(byName.get('from-profile').argv[byName.get('from-profile').argv.indexOf('--model') + 1], 'glm-5.3');
+});
+
+// The builder records model so the manifest is complete for launching.
+test('builder records the profile model in the manifest', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\ndescription: d\nmodel: glm-5.3\nrole: Lead\nlinkName: advisor\n---\nbody\n',
+  );
+
+  const inventory = await discoverTeam(root);
+  const { manifest } = buildTeamManifest(inventory, { hub: 'advisor' });
+  assert.equal(manifest.roles.advisor.model, 'glm-5.3');
+});
+
+// A role whose profile sits outside every discovery root has an unread
+// frontmatter, so no model is known. The harness default then applies, and that
+// must be reported rather than passed over — the same failure shape as the
+// pen-porter stub, where a silent fallback stood in for the real thing.
+test('launch plan warns when no model is known for a role', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'known.md'),
+    '---\nname: known\ndescription: d\nmodel: glm-5.3\n---\nbody\n',
+  );
+  // Outside the discovery roots, so discovery never reads its frontmatter.
+  await fs.mkdir(path.join(root, 'elsewhere'), { recursive: true });
+  await fs.writeFile(path.join(root, 'elsewhere', 'unknown.md'), '---\nname: unknown\n---\nbody\n');
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'known' },
+    roles: {
+      known: { profile: '.omp/agents/known.md' },
+      unknown: { profile: 'elsewhere/unknown.md' }
+    }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const plan = await resolveLaunchPlan(inventory);
+  assert.deepEqual(plan.errors, []);
+  const unknown = plan.roles.find((role) => role.name === 'unknown');
+  assert.equal(unknown.model, null);
+  assert.equal(unknown.argv.includes('--model'), false);
+  assert.match(plan.warnings.join('\n'), /roles\.unknown declares no model/);
+
+  // The known role is unaffected: it still gets its model.
+  const known = plan.roles.find((role) => role.name === 'known');
+  assert.equal(known.model, 'glm-5.3');
+});

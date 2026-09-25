@@ -495,7 +495,7 @@ $ pi-link --team-run                # launch (hub first, so it wins the link rac
 $ pi-link --team-run --roles advisor,app-ui
 ```
 
-Each role's profile body is written to `system-prompt.md` (frontmatter stripped) and passed as `omp --system-prompt @that-file`. `--dry-run` prints each role's resolved paths, prompt size and argv, and exits nonzero if the plan has errors — a broken plan never half-launches.
+Each role's profile body is written to `system-prompt.md` (frontmatter stripped) and passed as `omp --system-prompt @that-file`. `--model` comes from the manifest, falling back to the profile's own frontmatter — without that a role would silently run on the harness default while its profile named something else. `--dry-run` prints each role's resolved paths, model, prompt size and argv, and exits nonzero if the plan has errors — a broken plan never half-launches.
 
 This is what makes the manifest load-bearing rather than documentation. A launcher that hardcodes role paths is a second description of the same team, and the two drift silently: in one real repo a role's profile sat outside the naming convention the launcher assumed, so the role started with a 19-byte placeholder prompt instead of its 1.5 KB profile. The manifest had the correct path the whole time; nothing read it.
 

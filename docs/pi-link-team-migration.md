@@ -286,26 +286,33 @@ rm -rf ~/.omp/profiles/team-test
 
 ## What still duplicates after migrating
 
-Be honest about this: the manifest **does not remove duplication**, it makes
-breakage visible. A launcher's `case` block still states a model and a cwd that
-the profile frontmatter may also state. `folia-app` carries the model in both,
-and they agree today with nothing enforcing it.
+`--team-run` removes the path duplication: role selection, profile paths,
+`cwd`, `sessionDir`, `config` and `linkName` all come from the manifest, so a
+launcher no longer restates them. It also carries `model`, so a role launches on
+the model its profile declares rather than the harness default.
+
+What remains is `model` stated in two places for a repo that keeps its old
+launcher: `folia-app`'s `case` block and its profile frontmatter both name the
+model, and nothing enforces that they agree. Repos that launch through
+`--team-run` have no such duplication, because the manifest is the only place
+`--model` comes from.
 
 What the manifest catches is the failure, not the redundancy: a profile deleted,
-a session dir claimed by two roles, a required skill removed, a `cwd` that moved.
-
-Closing the duplication means having the launcher read `model` from the profile
-frontmatter it already parses instead of a `case` block — a small change to the
-launcher, and a separate one from this migration.
+a session dir claimed by two roles, a required skill removed, a `cwd` that moved,
+and — the case that actually bit — a profile sitting outside the naming
+convention a launcher assumed.
 
 ## Checklist
 
 ```
 [ ] pi-link --team            runs, lists what you expect
+[ ] pi-link --team-init       built the manifest (prefer over hand-writing)
 [ ] .pi-link/team.json        written, one role per real role
+[ ] hub.role set              --team-init refuses to guess between candidates
 [ ] cwd values exist          (sessionDir need not)
 [ ] pi-link --team-check      exit 0
-[ ] warnings reviewed         shadowed skill, new sessionDirs
+[ ] pi-link --team-run --dry-run   resolved paths, prompt sizes, argv
+[ ] warnings reviewed         shadowed skill, new sessionDirs, inert profiles
 [ ] preflight added           optional, before the zellij/tmux exec
 [ ] launcher still works      ./scripts/start-<team>-agents.sh unchanged
 ```

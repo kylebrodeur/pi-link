@@ -630,6 +630,10 @@ export function buildTeamManifest(inventory, options = {}) {
       linkName: key,
     };
     if (profile.role) entry.role = profile.role;
+    // Recorded so `--team-run` can pass `--model` and the manifest is complete
+    // for launching. Without it a role's model lives only in frontmatter, and a
+    // launcher reading the manifest would run the default instead.
+    if (profile.model) entry.model = profile.model;
     if (profile.skills?.length) entry.skills = { required: [...profile.skills] };
     roles[key] = entry;
   }
@@ -705,15 +709,30 @@ export async function resolveLaunchPlan(inventory, options = {}) {
       warnings.push(`roles.${name} profile is inert (${discovered.notLoadableBecause}), so no harness will register it as a subagent: ${role.profile}`);
     }
 
+    // Model: the manifest wins if it declares one, otherwise the profile's own
+    // frontmatter. Without this a role silently launches on the default model
+    // and its declared model is ignored — the profile says `glm-5.3` and the
+    // terminal runs something else, with nothing reporting the difference.
+    const model = role.model ?? discovered?.model ?? null;
+    if (!model) {
+      // Say it rather than letting the harness default stand in silently. This
+      // is the case for a profile outside every discovery root: the manifest
+      // knows the path but discovery never read its frontmatter, so no model is
+      // known and `--model` is omitted.
+      warnings.push(`roles.${name} declares no model and its profile was not discovered, so the harness default will be used: ${role.profile}`);
+    }
+
     const cwd = role.cwd ? path.resolve(root, role.cwd) : root;
     const sessionDir = role.sessionDir ? path.resolve(root, role.sessionDir) : null;
     const argv = ['--link-name', role.linkName ?? name, '--cwd', cwd];
+    if (model) argv.push('--model', model);
     if (sessionDir) argv.push('--session-dir', sessionDir);
     if (role.config) argv.push('--config', path.resolve(root, role.config));
 
     roles.push({
       name,
       linkName: role.linkName ?? name,
+      model,
       cwd,
       sessionDir,
       config: role.config ? path.resolve(root, role.config) : null,
@@ -743,6 +762,7 @@ export function formatLaunchPlan(plan) {
   for (const role of plan.roles) {
     const hub = role.isHub ? ' [hub]' : '';
     lines.push(`  ${role.linkName}${hub} — cwd ${role.cwd}`);
+    if (role.model) lines.push(`      model:   ${role.model}`);
     if (role.sessionDir) lines.push(`      session: ${role.sessionDir}`);
     if (role.config) lines.push(`      config:  ${role.config}`);
     lines.push(`      prompt:  ${role.promptBody.length} bytes`);

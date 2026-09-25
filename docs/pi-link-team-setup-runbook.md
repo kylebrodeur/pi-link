@@ -270,10 +270,15 @@ For Pi users to get the team commands via the github method, the code must be on
   all carrying `loadMode: "essential"` via `TOP_LEVEL_TOOL`.
 - `bin/team-config.mjs` is a **tracked** file on this branch. An earlier stray untracked copy
   of the old CLI monolith once sat at that path and has since been removed.
-- The team surface is **flags**, not a subcommand: `--team`, `--team --json`, `--team-check`.
-  Verified: `pi-link team` resolves the session named `team` rather than reporting a usage
-  error.
+- The team surface is **flags**, not a subcommand: `--team`, `--team --json`, `--team-check`,
+  `--team-init`, `--team-run`. Verified: `pi-link team` resolves the session named `team`
+  rather than reporting a usage error.
+- Read-only modes are `--team` and `--team-check`. `--team-init` writes only with `--write`
+  (and refuses to overwrite). `--team-run` spawns one `omp` per declared role.
+- `--team-run` passes `--model` from the manifest, falling back to the profile's own
+  frontmatter. A role therefore launches on its declared model rather than the harness
+  default.
 - The published npm release is `0.5.1`, which has the `loadMode` fix but not the team
   surface. The team work is unreleased at `0.6.0` on this branch.
-- Branch state is **local only** — nothing is pushed. Check with
-  `git log --oneline origin/feat/team-setup-discovery..HEAD` before referencing a revision.
+- Branch state is **pushed** to `origin/feat/team-setup-discovery`. Check with
+  `git log --oneline origin/feat/team-setup-discovery..HEAD` for anything local-only.
