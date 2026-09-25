@@ -6,6 +6,24 @@ This changelog is based on the git history from `2026-03-21` (initial commit) th
 
 ---
 
+## 0.6.0 — 2026-09-24
+
+### Added
+
+- **`pi-link --team` reports the agent team already present in a repository, and `pi-link --team-check` validates a declared composition.** A team is a set of agent profiles in one repository — a role, a model, and a working directory each — and until now every project re-invented the same launcher and the same conventions to describe it. `--team` discovers what exists rather than owning new artifacts: agent profiles under `.omp/agents/` and `.agents/`, skills under `.omp/skills/`, `.agents/skills/` and `skills/`, and launch scripts under `scripts/`, reading each profile's frontmatter for role, model and autoloaded skills. It is strictly read-only — it reads directory trees and reports, and never writes a file, starts a terminal, or touches link state. `--team --json` emits the same report as JSON so a launcher or a CI step can consume the resolved role paths directly. `--team-check` validates an optional declaration at `.pi-link/team.json`: every referenced profile, prompt and config file must exist, required skills must be present, `hub.role` must name a real role, and declared terminal names must not collide. Required errors exit `1` and print `ERROR …`; optional problems print `WARN …` and exit `0`, so a missing optional skill is never presented as a startup failure. Paths in a manifest are repo-relative and normalized against the repository root.
+
+- **A companion skill, `pi-link-team-setup`, walks the setup.** It covers discovery, the questions discovery cannot answer (the team name, the group suffix, which role coordinates), and writing a manifest only after the user confirms the proposal.
+
+### Notes
+
+- **The manifest is a thin set of references, not a copy.** It points at profiles, prompts and configs that already exist; it never duplicates a role prompt, a skill, or project policy, and it does not replace them. Repository policy files keep their authority, and Pi/OMP remains authoritative over which tools and skills actually exist at runtime — a declared capability is an intent, not a grant.
+
+- **This is a flag surface, not a `team` subcommand.** A subcommand would capture a session literally named `team`, making it unreachable — the same reserved-word collision removed in 0.1.15 when the `list` and `resolve` subcommands became `--list` and `--resolve`. `pi-link team` still resolves the session named `team`. `--json` now applies to `--team` as well as `--status`, and `--global` is rejected with the team modes for the same reason it is with `--status`: discovery reads one repository root, so a cross-cwd scope cannot mean anything.
+
+- **No new runtime dependency.** The manifest is JSON, parsed with `JSON.parse`, so pi-link keeps its single runtime dependency (`ws`). An earlier prototype used a YAML manifest and is not part of this release.
+
+---
+
 ## 0.5.1 — 2026-09-22
 
 ### Fixed

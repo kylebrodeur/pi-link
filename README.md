@@ -21,6 +21,7 @@ Questions, ideas? There's a [pi-link thread](https://discord.com/channels/145680
 - [LLM Tools](#llm-tools)
 - [Slash Commands](#slash-commands)
 - [CLI: `pi-link`](#cli-pi-link)
+- [Team composition: `--team`](#team-composition---team)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Limitations & Design Decisions](#limitations--design-decisions)
@@ -408,6 +409,87 @@ Exit `2` means no hub answered **at that instant**. When a hub exits, a survivin
 The endpoint is bound to `127.0.0.1` with no authentication, the same trust boundary as the WebSocket surface it shares a port with: any process on this machine can already connect to the link.
 
 Finally, `--status` and `--json` belong to the wrapper only until a session name appears. After one, they are pi's: `pi-link mybot --status` forwards `--status` to pi untouched, exactly like any other passthrough flag.
+
+### Team composition: `--team`
+
+A team is a set of agent profiles in one repository, each with a role, a model, and a working directory. `--team` reports what is already there:
+
+```bash
+pi-link --team           # what exists, plus the declared manifest summary
+pi-link --team --json    # the same report, machine-readable
+pi-link --team-check     # validate the declared manifest; exit 1 on errors
+```
+
+It is **read-only**: it reads directory trees and reports, and never writes a file, starts a terminal, or changes any link state. The natural fear — a tool that mutates a repo — does not apply here.
+
+**What it discovers.** Existing artifacts, rather than owning new ones: agent profiles in `.omp/agents/` and `.agents/`, skills in `.omp/skills/`, `.agents/skills/` and `skills/`, and launch scripts in `scripts/`. Profile frontmatter supplies the role, model, and autoloaded skills.
+
+```
+$ pi-link --team
+Root: ~/my-project
+Manifest: ~/my-project/.pi-link/team.json
+Profiles (2):
+  advisor (coordinator) · glm-5.2:cloud — ~/my-project/.omp/agents/advisor.md
+  builder (member) · kimi-k2.7-code:cloud — ~/my-project/.omp/agents/builder.md
+Skills (1): team-workflow
+Launch scripts (1):
+  start-team.sh — ~/my-project/scripts/start-team.sh
+
+Team: my-project
+Group: my-project
+Hub role: advisor
+  advisor (coordinator)
+  builder (member)
+```
+
+**What it validates.** An optional declaration at `.pi-link/team.json`:
+
+```json
+{
+  "version": 1,
+  "team": { "name": "my-project", "group": "my-project" },
+  "hub": { "role": "advisor", "mode": "designated" },
+  "roles": {
+    "advisor": {
+      "profile": ".omp/agents/advisor.md",
+      "skills": { "required": ["team-workflow"] },
+      "tools": { "required": ["read", "link_list", "link_send"], "requestable": ["browser"] }
+    }
+  }
+}
+```
+
+`--team-check` verifies that every referenced profile, prompt and config file exists, that required skills are present, that `hub.role` names a real role, and that declared terminal names do not collide. Required errors exit `1` and print `ERROR …`; optional problems print `WARN …` and exit `0`, so a missing optional skill is never presented as a startup failure.
+
+The manifest is a **thin set of references** to files that already exist. It never copies a role prompt, a skill, or project policy, and it does not replace them: repository policy files keep their authority, and Pi/OMP remains authoritative over which tools and skills actually exist at runtime. A declared capability is an intent, not a grant.
+
+**Paths in a manifest are repo-relative** and normalized against the repository root, so a manifest never carries an absolute path that works on one machine only.
+
+#### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | `--team` reported, or `--team-check` found no errors (warnings may have printed) |
+| `1` | `--team-check`: a missing manifest, an invalid manifest, or validation errors |
+| `64` | Reserved for pi-link's own usage errors; not used by `--team` |
+
+A malformed manifest is reported as a user error, not a crash:
+
+```
+ERROR team manifest is not valid JSON: ~/my-project/.pi-link/team.json
+```
+
+#### Notes
+
+`--team` and `--team --json` are the wrapper's modes only until a session name appears, exactly like `--status`: `pi-link mybot --team` forwards `--team` to pi untouched. `--json` is valid with `--team` as well as `--status`.
+
+`--global` is rejected with the team modes. Discovery reads one repository root, so a cross-cwd scope cannot mean anything — the same reasoning that makes `--status --global` an error rather than a silently ignored flag.
+
+**These are flags rather than a `team` subcommand on purpose.** A subcommand would capture a session literally named `team`, making it unreachable — the reserved-word collision upstream removed in 0.1.15 when `list` and `resolve` became flags. `pi-link team` still resolves the session named `team`.
+
+`--team` also reads the OMP session configs under `.omp/` so a manifest can reference one.
+
+The companion skill **`pi-link-team-setup`** walks an agent through discovery, the questions only a human can answer, and writing a manifest.
 
 ---
 
