@@ -256,6 +256,7 @@ For Pi users to get the team commands via the github method, the code must be on
 | OMP profiles isolate plugins | fresh profile reported `No plugins installed` |
 | Installing into a profile leaves default untouched | `omp plugin list` identical before/after |
 | `omp` accepts `#branch` in a git spec | `git:...pi-link#feat/team-setup-discovery` installed fine |
+| A `#branch` spec pulls the **pushed** tip, not local commits | install reported `0.5.1`/subcommand form, matching `origin` tip `442930b`, not local HEAD |
 | `omp` local-path install symlinks | `readlink` → `/Users/kylebrodeur/workspace/pi-link` |
 | Pi `-l` writes project-local settings only | `.pi/settings.json` written; global stayed `false` |
 | Pi github method ignores `#branch` | failed `is this a git repository?`; plain URL cloned `master` |
@@ -267,7 +268,12 @@ For Pi users to get the team commands via the github method, the code must be on
   project changelog): the tool, `prompt_request`/`prompt_response` wire messages, pending
   state and timeouts are gone. Registered tools are `link_send`, `link_compact`, `link_list`,
   all carrying `loadMode: "essential"` via `TOP_LEVEL_TOOL`.
-- The branch is pushed to `origin/feat/team-setup-discovery` at `78f9db8`.
-- There is an untracked stale CLI copy at
-  `/Users/kylebrodeur/workspace/pi-link/bin/team-config.mjs` (31,296 B, byte-identical to the
-  branch revision `92791f3:bin/pi-link.mjs`). It is redundant with git; left untouched.
+- `bin/team-config.mjs` is a **tracked** file on this branch. An earlier stray untracked copy
+  of the old CLI monolith once sat at that path and has since been removed.
+- The team surface is **flags**, not a subcommand: `--team`, `--team --json`, `--team-check`.
+  Verified: `pi-link team` resolves the session named `team` rather than reporting a usage
+  error.
+- The published npm release is `0.5.1`, which has the `loadMode` fix but not the team
+  surface. The team work is unreleased at `0.6.0` on this branch.
+- Branch state is **local only** — nothing is pushed. Check with
+  `git log --oneline origin/feat/team-setup-discovery..HEAD` before referencing a revision.
