@@ -7,9 +7,9 @@ from the two repos we migrated: `folia-app` (six roles) and `enviro-grow-pico`
 
 This is an internal document. It is not part of the upstream contribution.
 
-## What `--team` is, and what it is not
+## What `--team` is
 
-It is a **read-only declaration checker**:
+Inspection (read-only):
 
 - `--team` discovers the profiles, skills, launch scripts and OMP session configs
   already in a repo, and prints them, plus the declared manifest summary.
@@ -17,8 +17,38 @@ It is a **read-only declaration checker**:
 - `--team-check` validates the declared manifest against what exists. Exit 1 on
   errors, 0 when only warnings fired.
 
-It is **not** a launcher. It never spawns a process, never writes a file, and
-never touches link state. Nothing about it changes how your team starts.
+Composition (writes a manifest):
+
+- `--team-init` builds a manifest from discovery and prints it; `--write` creates
+  `.pi-link/team.json` and refuses to overwrite an existing one.
+
+Launch (spawns roles):
+
+- `--team-run` launches every role the manifest declares, reading the profile
+  path, `cwd`, `sessionDir`, `config` and `linkName` from the manifest.
+  `--dry-run` prints the resolved plan — argv, paths and prompt size — without
+  spawning anything.
+
+`--team` and `--team-check` remain strictly read-only: they report and never
+write. `--team-init` is the only writing mode, and it only writes when asked.
+`--team-run` is a launcher.
+
+## Why a manifest that can launch
+
+A manifest that only *describes* a team drifts from whatever actually starts it.
+A launcher that hardcodes each role's model, cwd and prompt path is a second
+description of the same team, and the two disagree silently.
+
+Real example from this migration: a role file lived at
+`.omp/plantfluent-agents/plantfluent-pen-porter.md`, but the launcher derived its
+prompt path from a naming convention (`.omp/agents/plantfluent-<role>.md`). That
+file did not exist, so the launcher fell back to a placeholder and the role
+started with a 19-byte stub prompt instead of its 1.5 KB profile — for months,
+without an error. The manifest declared the correct path the whole time. Nothing
+read it.
+
+`--team-run` reads the declared path, so that failure cannot recur by
+construction.
 
 ## Zellij / tmux is a different layer
 
@@ -35,13 +65,21 @@ Declaration layer   what the team IS
   .pi-link/team.json   the manifest
   pi-link --team       reports it
   pi-link --team-check validates it
+
+Manifest launch     the two layers meeting
+  pi-link --team-run   spawns the declared roles directly
 ```
 
-`pi-link` contains no reference to Zellij or tmux and has no code path that
-launches anything on `--team`. So migrating means **adding a manifest**, not
-changing your layout.
+`--team-run` is an *alternative* to Zellij, not an integration with it: it spawns
+one process per role with no panes, tiling or focus. A repo that depends on a
+Zellij layout should keep it, and can still add the preflight below. A repo that
+only needs the roles running can drop the layout entirely.
 
-The one thing worth adding is an optional preflight, before Zellij is invoked:
+`pi-link` contains no reference to Zellij or tmux. Migrating to the manifest
+means **adding a manifest**, not changing an existing layout.
+
+The one thing worth adding to a Zellij-based launcher is a preflight, before
+Zellij is invoked:
 
 ```zsh
 # In the start script, before the `exec zellij ...` line.

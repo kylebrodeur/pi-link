@@ -273,6 +273,10 @@ async function readProfile(filePath, origin) {
     role: frontmatter.role ?? frontmatter.type ?? frontmatter.description ?? null,
     model: frontmatter.model ?? null,
     skills: toStringList(frontmatter.autoloadSkills),
+    // The terminal name a profile asks to be known by. A team calls this role
+    // "advisor" even when the profile file is `plantfluent-advisor.md`, so it is
+    // the name a manifest and `--hub` should use.
+    linkName: frontmatter.linkName ?? null,
     loadable,
   };
   // Why it will not register, so the report can say it rather than leaving the
@@ -542,5 +546,209 @@ export function formatTeamReport(result) {
   }
   lines.push(`Launch scripts (${result.launchScripts.length}):`);
   for (const script of result.launchScripts) lines.push(`  ${script.id} — ${script.path}`);
+  return lines.join('\n');
+}
+
+// ─── Manifest building ───────────────────────────────────────────────────────
+
+// Guess a coordinator from role text. The builder does not decide the hub; it
+// only proposes one, and only when exactly one role looks like a coordinator.
+// Two candidates is an ambiguity a human resolves, not something to pick from.
+const COORDINATOR_PATTERN = /advisor|coordinator|lead|chief|architect|orchestrat/i;
+
+function looksLikeCoordinator(profile) {
+  return COORDINATOR_PATTERN.test(`${profile.role ?? ''} ${profile.id}`);
+}
+
+// Strip the leading frontmatter block, returning the prompt body. This is the
+// same transformation a launcher has to do before handing a profile to
+// `--system-prompt`: the frontmatter is metadata for the harness, not prompt
+// text, and passing it through would inject YAML into the model's instructions.
+export function profilePromptBody(content) {
+  const lines = content.split(/\r?\n/);
+  if (lines[0]?.trim() !== '---') return content;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === '---') return lines.slice(i + 1).join('\n').replace(/^\n+/, '');
+  }
+  // An unterminated block is not frontmatter; treat the file as body-only rather
+  // than silently returning an empty prompt.
+  return content;
+}
+
+// Build a manifest from discovery. This is a scaffold, not a guesser: every
+// `profile` comes from a discovered path, and anything discovery cannot know —
+// cwd, sessionDir, config — is omitted rather than invented. `--team-check`
+// then reports the gaps instead of the manifest asserting wrong values.
+//
+// Inert profiles are included, not dropped. `description` gates *subagent
+// registration*, which is not the same as being usable as a launch prompt: a
+// launcher reads the profile body via `--system-prompt` and never consults
+// frontmatter. Excluding them would silently produce an empty team for a repo
+// whose roles launch perfectly well — the opposite of a useful scaffold. They
+// are named in the notes instead, and `--team-check` warns on each.
+export function buildTeamManifest(inventory, options = {}) {
+  const {
+    roles: onlyRoles,
+    hub,
+    name,
+    group,
+  } = options;
+  const notes = [];
+  const root = inventory.root;
+
+  // Project profiles only: a user-level profile is machine-local, so writing its
+  // absolute path into a committed manifest would break for every other clone.
+  const candidates = (inventory.profiles ?? []).filter((profile) => profile.source === 'project');
+  // A role is keyed by the name the team actually calls it — the profile's
+  // declared `linkName` when present, else its id. A repo whose files are
+  // `plantfluent-advisor.md` still has a role called `advisor`, and the manifest
+  // is written in the vocabulary the team uses (`--hub advisor` must resolve).
+  const roleName = (profile) => profile.linkName ?? profile.id;
+  const byId = new Map(candidates.map((profile) => [roleName(profile), profile]));
+
+  let selected = candidates;
+  if (onlyRoles?.length) {
+    selected = candidates.filter((profile) => onlyRoles.includes(roleName(profile)));
+    for (const id of onlyRoles) {
+      if (!byId.has(id)) notes.push(`--roles named "${id}", but no project profile has that name`);
+    }
+  }
+  for (const profile of selected) {
+    if (profile.loadable === false) {
+      notes.push(`"${roleName(profile)}" is inert as a subagent (${profile.notLoadableBecause}); it still launches via --system-prompt`);
+    }
+  }
+
+  const teamName = name ?? path.basename(root);
+  const roles = {};
+  for (const profile of selected) {
+    const key = roleName(profile);
+    const entry = {
+      profile: path.relative(root, profile.path).split(path.sep).join('/'),
+      // Recorded explicitly rather than left implicit in the key: a launcher
+      // reads this field, and `--link-name` must not silently follow a rename.
+      linkName: key,
+    };
+    if (profile.role) entry.role = profile.role;
+    if (profile.skills?.length) entry.skills = { required: [...profile.skills] };
+    roles[key] = entry;
+  }
+
+  // Hub: explicit wins. Otherwise propose only a single unambiguous candidate.
+  let hubRole = hub ?? null;
+  if (!hubRole) {
+    const coordinators = selected.filter(looksLikeCoordinator);
+    if (coordinators.length === 1) {
+      hubRole = roleName(coordinators[0]);
+      notes.push(`proposed hub.role "${hubRole}" from role text — confirm or override with --hub`);
+    } else if (coordinators.length > 1) {
+      notes.push(`hub.role omitted: ${coordinators.length} roles look like a coordinator (${coordinators.map(roleName).join(', ')}); set one with --hub`);
+    } else {
+      notes.push('hub.role omitted: no role looks like a coordinator; set one with --hub');
+    }
+  } else if (!roles[hubRole]) {
+    notes.push(`--hub named "${hubRole}", which is not among the selected roles`);
+    hubRole = null;
+  }
+
+  const manifest = {
+    version: 1,
+    team: { name: teamName, group: group ?? teamName },
+    roles,
+  };
+  if (hubRole) manifest.hub = { role: hubRole, mode: 'designated' };
+
+  return { manifest, notes };
+}
+
+// ─── Launch planning ─────────────────────────────────────────────────────────
+
+// Resolve a manifest into the argv each role needs, and read each profile's
+// prompt body. This is what makes the manifest the single source of truth for a
+// launch: the launcher stops deriving paths from a naming convention and reads
+// the declared path instead, so a profile that sits outside the convention (a
+// role file kept beside its own session dir) still resolves.
+//
+// Every failure here is collected rather than thrown, so `--dry-run` can report
+// a whole plan's problems at once instead of stopping at the first.
+export async function resolveLaunchPlan(inventory, options = {}) {
+  const errors = [];
+  const warnings = [];
+  const manifest = inventory.manifest;
+  if (!manifest) return { roles: [], errors: ['no team manifest found'], warnings };
+
+  const root = inventory.root;
+  const onlyRoles = options.roles?.length ? new Set(options.roles) : null;
+  const resolvedBy = new Map(
+    (inventory.profiles ?? []).map((profile) => [profile.path, profile]),
+  );
+
+  const roles = [];
+  for (const [name, role] of Object.entries(manifest.roles ?? {})) {
+    if (onlyRoles && !onlyRoles.has(name)) continue;
+    if (!role.profile) {
+      errors.push(`roles.${name}.profile is required`);
+      continue;
+    }
+    const profilePath = path.resolve(root, role.profile);
+    let body;
+    try {
+      body = profilePromptBody(await fs.readFile(profilePath, 'utf8'));
+    } catch {
+      errors.push(`roles.${name}.profile is not readable: ${role.profile}`);
+      continue;
+    }
+    const discovered = resolvedBy.get(profilePath);
+    if (discovered?.loadable === false) {
+      // The prompt still reaches the model via --system-prompt, so this is a
+      // warning about subagent registration, not a launch blocker.
+      warnings.push(`roles.${name} profile is inert (${discovered.notLoadableBecause}), so no harness will register it as a subagent: ${role.profile}`);
+    }
+
+    const cwd = role.cwd ? path.resolve(root, role.cwd) : root;
+    const sessionDir = role.sessionDir ? path.resolve(root, role.sessionDir) : null;
+    const argv = ['--link-name', role.linkName ?? name, '--cwd', cwd];
+    if (sessionDir) argv.push('--session-dir', sessionDir);
+    if (role.config) argv.push('--config', path.resolve(root, role.config));
+
+    roles.push({
+      name,
+      linkName: role.linkName ?? name,
+      cwd,
+      sessionDir,
+      config: role.config ? path.resolve(root, role.config) : null,
+      isHub: manifest.hub?.role === name,
+      argv,
+      promptBody: body,
+    });
+  }
+
+  // The hub has to be a role that actually launches, or nothing coordinates.
+  if (manifest.hub?.role && !roles.some((role) => role.isHub)) {
+    errors.push(`hub.role "${manifest.hub.role}" is not among the launched roles`);
+  }
+  if (onlyRoles) {
+    for (const wanted of onlyRoles) {
+      if (!roles.some((role) => role.name === wanted)) {
+        warnings.push(`--roles named "${wanted}", which is not a declared role`);
+      }
+    }
+  }
+  return { roles, errors, warnings };
+}
+
+export function formatLaunchPlan(plan) {
+  const lines = [];
+  lines.push(`Launch plan (${plan.roles.length} role${plan.roles.length === 1 ? '' : 's'}):`);
+  for (const role of plan.roles) {
+    const hub = role.isHub ? ' [hub]' : '';
+    lines.push(`  ${role.linkName}${hub} — cwd ${role.cwd}`);
+    if (role.sessionDir) lines.push(`      session: ${role.sessionDir}`);
+    if (role.config) lines.push(`      config:  ${role.config}`);
+    lines.push(`      prompt:  ${role.promptBody.length} bytes`);
+    lines.push(`      argv:    ${role.argv.join(' ')}`);
+  }
+  for (const warning of plan.warnings) lines.push(`WARN ${warning}`);
+  for (const error of plan.errors) lines.push(`ERROR ${error}`);
   return lines.join('\n');
 }

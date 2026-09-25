@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { discoverTeam, loadTeamConfig, validateTeamConfig, formatTeamReport } from '../bin/team-config.mjs';
+import { discoverTeam, loadTeamConfig, validateTeamConfig, formatTeamReport, buildTeamManifest, resolveLaunchPlan, formatLaunchPlan, profilePromptBody } from '../bin/team-config.mjs';
 
 async function tempRepo() {
   return fs.mkdtemp(path.join(os.tmpdir(), 'pi-link-team-'));
@@ -376,4 +376,227 @@ test('formats a concise discovery report', () => {
   assert.match(text, /\[project, legacy pi\] old/);
   assert.match(text, /Skills \(1\): workflow/);
   assert.match(text, /Launch scripts \(1\):/);
+});
+
+// ─── Manifest building ───────────────────────────────────────────────────────
+
+// The builder exists so a manifest can be created from discovery rather than by
+// hand. Its output has to satisfy the same validator every other manifest does,
+// or the scaffold is worse than useless.
+test('builder output round-trips through the validator', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\ndescription: d\nrole: Lead\nlinkName: advisor\n---\nbody\n',
+  );
+
+  const inventory = await discoverTeam(root);
+  const { manifest, notes } = buildTeamManifest(inventory, { hub: 'advisor' });
+  assert.equal(manifest.hub.role, 'advisor');
+  assert.deepEqual(Object.keys(manifest.roles), ['advisor']);
+
+  // Write it, then validate the written file the way --team-check does.
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify(manifest));
+  const written = await discoverTeam(root);
+  const result = validateTeamConfig(written.manifest, {
+    existingPaths: written.existingPaths,
+    existingDirs: written.existingDirs,
+    skillIds: new Set(written.skills.map((s) => s.id)),
+    skills: written.skills,
+    profiles: written.profiles,
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(notes, []);
+});
+
+// A role is named the way the team names it. A repo whose file is
+// `plantfluent-advisor.md` has a role called `advisor`, so `--hub advisor` must
+// resolve rather than silently failing to match anything.
+test('builder keys roles by declared linkName, not the profile filename', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'plantfluent-advisor.md'),
+    '---\nname: plantfluent-advisor\ndescription: d\nlinkName: advisor\n---\nbody\n',
+  );
+
+  const inventory = await discoverTeam(root);
+  const { manifest, notes } = buildTeamManifest(inventory, { hub: 'advisor' });
+  assert.deepEqual(Object.keys(manifest.roles), ['advisor']);
+  assert.equal(manifest.roles.advisor.linkName, 'advisor');
+  assert.equal(manifest.hub.role, 'advisor');
+  assert.deepEqual(notes, []);
+});
+
+// The hub is a decision, not an inference. With two plausible coordinators the
+// builder must omit hub.role and say so, rather than picking one arbitrarily.
+test('builder omits an ambiguous hub instead of guessing', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  for (const id of ['advisor', 'coordinator']) {
+    await fs.writeFile(
+      path.join(root, '.omp', 'agents', `${id}.md`),
+      `---\nname: ${id}\ndescription: d\nrole: Lead\n---\nbody\n`,
+    );
+  }
+
+  const inventory = await discoverTeam(root);
+  const { manifest, notes } = buildTeamManifest(inventory);
+  assert.equal(manifest.hub, undefined);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /hub\.role omitted/);
+});
+
+// An inert profile still launches: the launcher reads the body via
+// --system-prompt and never consults frontmatter. Dropping it would produce an
+// empty team for a repo whose roles work, so it is kept and annotated.
+test('builder keeps an inert profile and notes why it is inert', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'quiet.md'), '---\nname: quiet\n---\nbody\n');
+
+  const inventory = await discoverTeam(root);
+  const { manifest, notes } = buildTeamManifest(inventory);
+  assert.deepEqual(Object.keys(manifest.roles), ['quiet']);
+  // Two notes: the inert profile, and the omitted hub (a profile named "quiet"
+  // is not a coordinator, so none is proposed).
+  assert.equal(notes.length, 2);
+  assert.match(notes.join('\n'), /inert as a subagent \(missing description\)/);
+  assert.match(notes.join('\n'), /hub\.role omitted/);
+});
+
+// A user-level profile is machine-local. Writing its absolute path into a
+// committed manifest would break for every other clone of the repository.
+test('builder excludes user-level profiles from a committed manifest', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'project-role.md'),
+    '---\nname: project-role\ndescription: d\n---\nbody\n',
+  );
+
+  const inventory = await discoverTeam(root);
+  inventory.profiles.push({
+    path: path.join(os.homedir(), '.omp', 'agent', 'agents', 'local-role.md'),
+    id: 'local-role', source: 'user', harness: 'omp', loadable: true, role: null, model: null, skills: [],
+  });
+  const { manifest } = buildTeamManifest(inventory);
+  assert.deepEqual(Object.keys(manifest.roles), ['project-role']);
+});
+
+// ─── Launch planning ─────────────────────────────────────────────────────────
+
+test('profilePromptBody strips frontmatter and keeps the body', () => {
+  assert.equal(profilePromptBody('---\nname: a\nmodel: m\n---\nYou are A.\n'), 'You are A.\n');
+  // No frontmatter at all: the whole file is the prompt.
+  assert.equal(profilePromptBody('You are A.\n'), 'You are A.\n');
+  // An unterminated block is not frontmatter; returning empty here would launch
+  // a role with no instructions at all.
+  assert.equal(profilePromptBody('---\nname: a\nYou are A.\n'), '---\nname: a\nYou are A.\n');
+});
+
+// The point of the launch plan: profile paths come from the manifest, not from a
+// filename convention. This is the `pen-porter` failure — a role whose profile
+// sits outside `.omp/agents/` got a stub prompt because the launcher derived the
+// path instead of reading it.
+test('launch plan resolves a profile that sits outside the naming convention', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'plantfluent-agents', 'pen-porter.md'),
+    '---\nname: pen-porter\n---\nYou port pens.\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'pen-porter' },
+    roles: { 'pen-porter': { profile: '.omp/plantfluent-agents/pen-porter.md' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const plan = await resolveLaunchPlan(inventory);
+  assert.deepEqual(plan.errors, []);
+  assert.equal(plan.roles.length, 1);
+  // The real body, not a placeholder stub.
+  assert.match(plan.roles[0].promptBody, /You port pens\./);
+  assert.equal(plan.roles[0].isHub, true);
+});
+
+// A hub naming a role that does not launch means nothing coordinates the team.
+test('launch plan rejects a hub that is not a launched role', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(path.join(root, 'role.md'), '---\nname: r\n---\nbody\n');
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'absent' },
+    roles: { r: { profile: 'role.md' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const plan = await resolveLaunchPlan(inventory);
+  assert.match(plan.errors.join('\n'), /hub\.role "absent" is not among the launched roles/);
+});
+
+// A missing profile is reported for every role at once, so one bad entry does
+// not hide the others behind an early exit.
+test('launch plan collects every unreadable profile rather than stopping at the first', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'a' },
+    roles: {
+      a: { profile: 'missing-a.md' },
+      b: { profile: 'missing-b.md' }
+    }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const plan = await resolveLaunchPlan(inventory);
+  assert.equal(plan.roles.length, 0);
+  // Both unreadable profiles are named, plus the hub that consequently never
+  // launched — the point is that one bad entry does not hide the others.
+  assert.equal(plan.errors.length, 3);
+  assert.match(plan.errors.join('\n'), /missing-a\.md/);
+  assert.match(plan.errors.join('\n'), /missing-b\.md/);
+  assert.match(plan.errors.join('\n'), /hub\.role "a" is not among the launched roles/);
+});
+
+// --roles narrows the launch, and naming a role the manifest does not declare is
+// a warning rather than silence: a typo would otherwise launch nothing.
+test('launch plan honours --roles and warns on an unknown name', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(path.join(root, 'a.md'), '---\nname: a\n---\nA\n');
+  await fs.writeFile(path.join(root, 'b.md'), '---\nname: b\n---\nB\n');
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'a' },
+    roles: { a: { profile: 'a.md' }, b: { profile: 'b.md' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const plan = await resolveLaunchPlan(inventory, { roles: ['b', 'typo'] });
+  assert.deepEqual(plan.roles.map((r) => r.name), ['b']);
+  assert.match(plan.warnings.join('\n'), /"--roles named "typo""|named "typo"/);
+});
+
+test('formatLaunchPlan names the hub and each prompt size', () => {
+  const text = formatLaunchPlan({
+    roles: [{
+      name: 'advisor', linkName: 'advisor', cwd: '/repo', sessionDir: '/repo/s',
+      config: null, isHub: true, argv: ['--link-name', 'advisor'], promptBody: 'x'.repeat(10),
+    }],
+    warnings: [], errors: [],
+  });
+  assert.match(text, /Launch plan \(1 role\):/);
+  assert.match(text, /advisor \[hub\]/);
+  assert.match(text, /prompt: {2}10 bytes/);
 });

@@ -11,13 +11,13 @@
 //                                Print just the session path (machine-readable).
 //   pi-link --version            Print the installed pi-link version.
 
-import { readdir, stat } from "fs/promises";
+import { mkdir, readdir, stat, writeFile } from "fs/promises";
 import { createReadStream, existsSync, readFileSync } from "fs";
 import { createInterface } from "readline";
 import { join } from "path";
 import { homedir } from "os";
 import { spawn } from "child_process";
-import { discoverTeam, formatTeamReport, validateTeamConfig } from "./team-config.mjs";
+import { discoverTeam, formatTeamReport, validateTeamConfig, buildTeamManifest, resolveLaunchPlan, formatLaunchPlan } from "./team-config.mjs";
 
 // Canonicalize a link/session name: trim + collapse internal whitespace.
 // Must match the extension's normalizeName (index.ts).
@@ -310,6 +310,8 @@ function printHelp() {
   console.error("       pi-link --resolve <name> [--global|-g]");
   console.error("       pi-link --team [--json]");
   console.error("       pi-link --team-check");
+  console.error("       pi-link --team-init [--write] [--hub <role>] [--roles a,b] [--group <name>]");
+  console.error("       pi-link --team-run [--dry-run] [--roles a,b]");
   console.error("       pi-link --version");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
@@ -337,6 +339,8 @@ function describeMode(mode) {
     case "resolve": return "--resolve";
     case "team": return "--team";
     case "team-check": return "--team-check";
+    case "team-init": return "--team-init";
+    case "team-run": return "--team-run";
     case "launcher": return "session name";
     default: return mode;
   }
@@ -352,12 +356,19 @@ function describeMode(mode) {
 //   5. Launcher passthrough (mode launcher) with orphan-positional rejection
 
 const state = {
-  mode: null, // null | "help" | "version" | "list" | "status" | "resolve" | "team" | "team-check" | "launcher"
+  mode: null, // null | "help" | "version" | "list" | "status" | "resolve" | "team" | "team-check" | "team-init" | "team-run" | "launcher"
   resolveName: null,
   launcherName: null,
   global: false,
   json: false,
   piPassthrough: [],
+  // Team composition options. Shared by --team-init and --team-run so the two
+  // halves of the surface take the same selection flags.
+  teamRoles: null,
+  teamHub: null,
+  teamGroup: null,
+  teamWrite: false,
+  teamDryRun: false,
 };
 
 function setMode(mode) {
@@ -427,6 +438,37 @@ for (let i = 0; i < rawArgs.length; i++) {
     setMode("team-check");
     continue;
   }
+  if (a === "--team-init" && state.mode !== "launcher") {
+    setMode("team-init");
+    continue;
+  }
+  if (a === "--team-run" && state.mode !== "launcher") {
+    setMode("team-run");
+    continue;
+  }
+  // Shared selection flags for the composition modes. A flag without its value
+  // is a usage error rather than a silent default, because both `--roles` and
+  // `--hub` change what gets written or launched.
+  if ((a === "--roles" || a === "--hub" || a === "--group")
+    && (state.mode === "team-init" || state.mode === "team-run")) {
+    const next = rawArgs[i + 1];
+    if (next === undefined || next.startsWith("-")) {
+      fail(`${a} requires a value.\n  Usage: pi-link --team-init [--write] [--hub <role>] [--roles a,b] [--group <name>]`);
+    }
+    if (a === "--roles") state.teamRoles = next.split(",").map((s) => s.trim()).filter(Boolean);
+    else if (a === "--hub") state.teamHub = next.trim();
+    else state.teamGroup = next.trim();
+    i++;
+    continue;
+  }
+  if (a === "--write" && state.mode === "team-init") {
+    state.teamWrite = true;
+    continue;
+  }
+  if (a === "--dry-run" && state.mode === "team-run") {
+    state.teamDryRun = true;
+    continue;
+  }
   if (a.startsWith("--resolve=")) {
     setMode("resolve");
     if (state.resolveName !== null) fail(`--resolve specified more than once`);
@@ -466,6 +508,12 @@ for (let i = 0; i < rawArgs.length; i++) {
   }
   if (state.mode === "team-check") {
     fail(`--team-check does not accept arguments: ${a}\n  Usage: pi-link --team-check`);
+  }
+  if (state.mode === "team-init") {
+    fail(`--team-init does not accept positional arguments: ${a}\n  Usage: pi-link --team-init [--write] [--hub <role>] [--roles a,b] [--group <name>]`);
+  }
+  if (state.mode === "team-run") {
+    fail(`--team-run does not accept positional arguments: ${a}\n  Usage: pi-link --team-run [--dry-run] [--roles a,b]`);
   }
 
   // Phase 4: launcher mode entry. state.mode === null here, no name set yet.
@@ -518,10 +566,10 @@ if (state.mode === "resolve") {
 if (state.mode === "status" && state.global) {
   fail(`cannot combine --status and --global`);
 }
-// Team discovery reads one repository root, so a cross-cwd scope is meaningless
+// Team modes read one repository root, so a cross-cwd scope is meaningless
 // rather than merely unused — the same reasoning as --status above.
-if ((state.mode === "team" || state.mode === "team-check") && state.global) {
-  fail(`cannot combine --${state.mode === "team" ? "team" : "team-check"} and --global`);
+if (state.mode?.startsWith("team") && state.global) {
+  fail(`cannot combine --${state.mode} and --global`);
 }
 if (state.json && state.mode !== "status" && state.mode !== "team") {
   fail(`--json is only valid with --status or --team`);
@@ -560,6 +608,12 @@ switch (state.mode) {
     break;
   case "team-check":
     await runTeamCheck();
+    break;
+  case "team-init":
+    await runTeamInit(state);
+    break;
+  case "team-run":
+    await runTeamRun(state);
     break;
   case "launcher":
     await runLauncher(state);
@@ -815,6 +869,98 @@ async function loadTeamInventory() {
   } catch (error) {
     console.error(`ERROR ${error.message}`);
     process.exit(1);
+  }
+}
+
+// Build a manifest from what discovery found. Printing is the default: writing
+// requires --write, and --write refuses to clobber, because the manifest is a
+// composition decision a human makes rather than a generated artifact.
+async function runTeamInit(state) {
+  const inventory = await loadTeamInventory();
+  const { manifest, notes } = buildTeamManifest(inventory, {
+    roles: state.teamRoles,
+    hub: state.teamHub,
+    group: state.teamGroup,
+  });
+
+  if (!state.teamWrite) {
+    console.log(JSON.stringify(manifest, null, 2));
+    for (const note of notes) console.error(`NOTE ${note}`);
+    console.error("");
+    console.error("Nothing written. Re-run with --write to create .pi-link/team.json.");
+    return;
+  }
+
+  const target = join(inventory.root, ".pi-link", "team.json");
+  if (existsSync(target)) {
+    console.error(`ERROR refusing to overwrite an existing manifest: ${target}`);
+    console.error("Review it, or move it aside first.");
+    process.exit(1);
+  }
+  await mkdir(join(inventory.root, ".pi-link"), { recursive: true });
+  await writeFile(target, JSON.stringify(manifest, null, 2) + "\n", "utf-8");
+  console.log(`Wrote ${target}`);
+  for (const note of notes) console.error(`NOTE ${note}`);
+  console.error("");
+  console.error("Next: fill the omitted fields (cwd, sessionDir, config), then run pi-link --team-check.");
+}
+
+// Launch every role the manifest declares, using the manifest as the source of
+// truth for profile paths, cwd, session dir and config. Spawning is the whole
+// point of a manifest, so this is the mode that makes it load-bearing rather
+// than decorative.
+async function runTeamRun(state) {
+  const inventory = await loadTeamInventory();
+  const plan = await resolveLaunchPlan(inventory, { roles: state.teamRoles });
+
+  if (state.teamDryRun) {
+    console.log(formatLaunchPlan(plan));
+    if (plan.errors.length) process.exit(1);
+    return;
+  }
+  // A plan with errors must not half-launch: report everything, start nothing.
+  if (plan.errors.length) {
+    console.error(formatLaunchPlan(plan));
+    process.exit(1);
+  }
+  for (const warning of plan.warnings) console.error(`WARN ${warning}`);
+
+  // The hub goes first so it wins the hub race on the link port, which is the
+  // same ordering constraint the manual launcher encodes.
+  const ordered = [...plan.roles].sort((a, b) => Number(b.isHub) - Number(a.isHub));
+  const children = [];
+  for (const role of ordered) {
+    // The prompt body is delivered through a file so a long prompt never has to
+    // survive shell quoting, and so `omp --system-prompt @file` reads it whole.
+    //
+    // It is written whenever a prompt exists, not only when the role declares a
+    // sessionDir: a manifest that omits sessionDir would otherwise launch the
+    // role with no prompt at all — the profile body silently dropped, which is
+    // the same class of failure as the pen-porter stub. Without a sessionDir the
+    // file goes under pi-link's own namespace, so no session layout is invented.
+    let promptFile = null;
+    if (role.promptBody.trim()) {
+      const promptDir = role.sessionDir ?? join(inventory.root, ".pi-link", ".prompts", role.name);
+      await mkdir(promptDir, { recursive: true });
+      promptFile = join(promptDir, "system-prompt.md");
+      await writeFile(promptFile, role.promptBody, "utf-8");
+    }
+    const argv = [...role.argv];
+    if (promptFile) argv.push("--system-prompt", `@${promptFile}`);
+    console.error(`Launching ${role.linkName}${role.isHub ? " [hub]" : ""} — ${role.cwd}`);
+    children.push(spawn("omp", argv, { stdio: "inherit", cwd: role.cwd }));
+  }
+
+  // One role exiting is not a reason to tear down the rest of the team, but the
+  // wrapper has to stay alive or the terminals lose their parent.
+  let remaining = children.length;
+  for (const child of children) {
+    child.once("exit", () => { remaining -= 1; if (remaining === 0) process.exit(0); });
+    child.once("error", (err) => {
+      console.error(`Failed to launch: ${err.message}`);
+      remaining -= 1;
+      if (remaining === 0) process.exit(1);
+    });
   }
 }
 

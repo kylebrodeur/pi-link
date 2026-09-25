@@ -479,6 +479,28 @@ It also warns when a skill id appears in more than one skill root — the same s
 
 A declared `profile` that exists but sits **outside every harness's agent roots** also warns rather than failing, because a launcher can still read it by path (as `--system-prompt`) even though neither harness will load it as a subagent. The warning names the path so the difference is never silent. A profile in a Pi-only root (`.pi/agents`, `.agents`) does not warn: it is loadable, just by Pi.
 
+**Building a manifest.** `pi-link --team-init` builds a manifest from discovery and prints it. Nothing is written unless you pass `--write`, which refuses to overwrite an existing manifest:
+
+```
+$ pi-link --team-init --write --hub advisor --group my-team
+```
+
+Paths come from discovery; the hub comes from `--hub`. Anything discovery cannot know — `cwd`, `sessionDir`, `config` — is **omitted rather than invented**, so `--team-check` reports the gaps instead of the manifest asserting a guess. Roles are keyed by the profile's declared `linkName` when it has one, so a file named `plantfluent-advisor.md` yields a role called `advisor`. User-level profiles are excluded: their absolute paths are machine-local and would break for every other clone.
+
+**Launching from a manifest.** `pi-link --team-run` starts every role the manifest declares, reading the profile path, `cwd`, `sessionDir`, `config` and `linkName` from the manifest rather than deriving them from a naming convention:
+
+```
+$ pi-link --team-run --dry-run      # print the resolved plan, spawn nothing
+$ pi-link --team-run                # launch (hub first, so it wins the link race)
+$ pi-link --team-run --roles advisor,app-ui
+```
+
+Each role's profile body is written to `system-prompt.md` (frontmatter stripped) and passed as `omp --system-prompt @that-file`. `--dry-run` prints each role's resolved paths, prompt size and argv, and exits nonzero if the plan has errors — a broken plan never half-launches.
+
+This is what makes the manifest load-bearing rather than documentation. A launcher that hardcodes role paths is a second description of the same team, and the two drift silently: in one real repo a role's profile sat outside the naming convention the launcher assumed, so the role started with a 19-byte placeholder prompt instead of its 1.5 KB profile. The manifest had the correct path the whole time; nothing read it.
+
+`--team-run` is an **alternative** to a Zellij/tmux layout, not an integration with it: it spawns one process per role with no panes or tiling.
+
 The manifest is a **thin set of references** to files that already exist. It never copies a role prompt, a skill, or project policy, and it does not replace them: repository policy files keep their authority, and Pi/OMP remains authoritative over which tools and skills actually exist at runtime. A declared capability is an intent, not a grant.
 
 **Paths in a manifest are repo-relative** and normalized against the repository root, so a manifest never carries an absolute path that works on one machine only.

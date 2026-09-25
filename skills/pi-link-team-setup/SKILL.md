@@ -31,6 +31,17 @@ Use this skill when a user asks to discover, define, validate, or start a local 
 7. Identify tools explicitly used by each role. Do not infer access from a role name.
 8. Show the proposed composition to the user before writing anything.
 
+Prefer `pi-link --team-init` over hand-writing the manifest: it derives role paths
+from discovery, so a path that does not exist cannot be written. Add `--hub` to
+name the coordinator (never let the builder guess between two candidates), then
+`--write`. Finish the omitted fields (`cwd`, `sessionDir`, `config`) by hand —
+discovery cannot know them, and that is deliberate.
+
+The manifest is load-bearing, not documentation: `pi-link --team-run` launches
+from it. A role's prompt comes from the declared `profile` path, so a profile
+outside the usual naming convention still resolves. `--team-run --dry-run` first
+to see the resolved argv and prompt sizes before anything starts.
+
 ## Interactive setup questions
 
 Ask only for information discovery cannot establish:
