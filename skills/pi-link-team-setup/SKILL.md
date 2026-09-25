@@ -19,6 +19,8 @@ Use this skill when a user asks to discover, define, validate, or start a local 
 - A declared coordinator/hub role is a startup convention until the runtime enforces it.
 - A capability request cannot grant a tool that Pi/OMP does not expose.
 - A profile needs both `name` and `description` in frontmatter to register at all; without them it is inert no matter how correct its path is. `--team` marks these `(INERT: …)` and `--team-check` warns when a declared role points at one.
+- Declare `model` in the manifest. It is the primary driver: a declared model wins over the profile's frontmatter, and `--team-run` passes `--model` from it. `--team-check` validates the value against what the harness actually reports.
+- The harness matters for launching, not just discovery: `pi` rejects `--link-name`, `--cwd` and `--config`, which `omp` accepts. `--team-run` infers the harness from the repo's profile roots and takes `--harness` to override.
 
 ## Discovery workflow
 

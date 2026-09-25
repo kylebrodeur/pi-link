@@ -487,15 +487,27 @@ $ pi-link --team-init --write --hub advisor --group my-team
 
 Paths come from discovery; the hub comes from `--hub`. Anything discovery cannot know — `cwd`, `sessionDir`, `config` — is **omitted rather than invented**, so `--team-check` reports the gaps instead of the manifest asserting a guess. Roles are keyed by the profile's declared `linkName` when it has one, so a file named `plantfluent-advisor.md` yields a role called `advisor`. User-level profiles are excluded: their absolute paths are machine-local and would break for every other clone.
 
-**Launching from a manifest.** `pi-link --team-run` starts every role the manifest declares, reading the profile path, `cwd`, `sessionDir`, `config` and `linkName` from the manifest rather than deriving them from a naming convention:
+**Launching from a manifest.** `pi-link --team-run` starts every role the manifest declares, reading the profile path, `cwd`, `sessionDir`, `config`, `linkName` and `model` from the manifest rather than deriving them from a naming convention:
 
 ```
 $ pi-link --team-run --dry-run      # print the resolved plan, spawn nothing
 $ pi-link --team-run                # launch (hub first, so it wins the link race)
 $ pi-link --team-run --roles advisor,app-ui
+$ pi-link --team-run --harness pi   # force the harness (default: inferred)
 ```
 
-Each role's profile body is written to `system-prompt.md` (frontmatter stripped) and passed as `omp --system-prompt @that-file`. `--model` comes from the manifest, falling back to the profile's own frontmatter — without that a role would silently run on the harness default while its profile named something else. `--dry-run` prints each role's resolved paths, model, prompt size and argv, and exits nonzero if the plan has errors — a broken plan never half-launches.
+**Both harnesses.** `omp` and `pi` do not share a flag surface, so the argv is built from what the target accepts:
+
+| Flag | `omp` | `pi` |
+|---|---|---|
+| `--link-name`, `--cwd`, `--config` | yes | no — pi reaches its directory through the spawn cwd and takes its link name through the extension's `PI_LINK_NAME` handoff |
+| `--model`, `--system-prompt`, `--session-dir` | yes | yes |
+
+The harness defaults to the one the repo's profile roots belong to — a repo whose profiles live only under `.pi/agents` is a Pi team — and `--harness` overrides it. A declared `config` on a pi role is reported, since pi has no `--config`.
+
+Each role's profile body is written to `system-prompt.md` (frontmatter stripped) and passed as `--system-prompt @that-file`. `--model` comes from the manifest, falling back to the profile's own frontmatter — without that a role would silently run on the harness default while its profile named something else. `--dry-run` prints each role's resolved harness, paths, model, prompt size and argv, and exits nonzero if the plan has errors — a broken plan never half-launches, and the wrapper's exit code reflects the first role that failed to start.
+
+**Models are checked against the harness.** `--team-check` compares each declared model with what the harness actually reports — omp's registry via `models --json`, and pi's enabled models from its settings file. Neither list is hardcoded, since a hardcoded table rejects valid ids as soon as a provider adds a model. Comparison is normalized (provider prefix and `:suffix` stripped, fuzzy substring either way), because the harnesses spell one model differently — omp reports id `glm-5.3` with selector `ollama-cloud/glm-5.3`, while pi enables `ollama/glm-5.3:cloud`. An unavailable registry skips the check rather than rejecting everything.
 
 This is what makes the manifest load-bearing rather than documentation. A launcher that hardcodes role paths is a second description of the same team, and the two drift silently: in one real repo a role's profile sat outside the naming convention the launcher assumed, so the role started with a 19-byte placeholder prompt instead of its 1.5 KB profile. The manifest had the correct path the whole time; nothing read it.
 
