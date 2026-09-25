@@ -798,6 +798,7 @@ async function runTeamCheck() {
     existingDirs: inventory.existingDirs,
     skillIds: new Set(inventory.skills.map((skill) => skill.id)),
     skills: inventory.skills,
+    profiles: inventory.profiles,
   });
   for (const error of result.errors) console.error(`ERROR ${error}`);
   for (const warning of result.warnings) console.error(`WARN ${warning}`);

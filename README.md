@@ -422,15 +422,17 @@ pi-link --team-check     # validate the declared manifest; exit 1 on errors
 
 It is **read-only**: it reads directory trees and reports, and never writes a file, starts a terminal, or changes any link state. The natural fear — a tool that mutates a repo — does not apply here.
 
-**What it discovers.** Existing artifacts, rather than owning new ones: agent profiles in `.omp/agents/` and `.agents/`, skills in `.omp/skills/`, `.agents/skills/` and `skills/`, and launch scripts in `scripts/`. Profile frontmatter supplies the role, model, and autoloaded skills.
+**What it discovers.** Existing artifacts, rather than owning new ones: agent profiles under `.omp/agents/` (project) and `.omp/agent/agents/` (user), skills in `.omp/skills/`, `.agents/skills/` and `skills/`, and launch scripts in `scripts/`. Profile frontmatter supplies the name, role, model, and autoloaded skills.
+
+Profiles are **inventory, not roster.** Everything OMP can load is listed, labelled `[project]` or `[user]`; a role joins the team only by being declared in the manifest. `.agents/` is scanned too, but as a legacy location — verified: OMP does **not** load agent definitions from `.agents/*.md` or `.pi/agents/*.md`, only from `.omp/agents` and `~/.omp/agent/agents`.
 
 ```
 $ pi-link --team
 Root: ~/my-project
 Manifest: ~/my-project/.pi-link/team.json
-Profiles (2):
-  advisor (coordinator) · glm-5.2:cloud — ~/my-project/.omp/agents/advisor.md
-  builder (member) · kimi-k2.7-code:cloud — ~/my-project/.omp/agents/builder.md
+Profiles available (2):
+  [project] advisor (coordinator) · glm-5.2:cloud — ~/my-project/.omp/agents/advisor.md
+  [project] builder (member) · kimi-k2.7-code:cloud — ~/my-project/.omp/agents/builder.md
 Skills (1): team-workflow
 Launch scripts (1):
   start-team.sh — ~/my-project/scripts/start-team.sh
@@ -462,6 +464,8 @@ Hub role: advisor
 `--team-check` verifies that every referenced profile, prompt and config file exists, that required skills are present, that `hub.role` names a real role, that declared terminal names do not collide, and that no two roles share a session directory. Required errors exit `1` and print `ERROR …`; optional problems print `WARN …` and exit `0`, so a missing optional skill is never presented as a startup failure.
 
 It also warns when a skill id appears in more than one skill root — the same skill present in both the tracked source (`skills/`) and a local install (`.agents/skills/`, typically gitignored alongside `skills-lock.json`). That pair is the normal source-to-install relationship, so it is a warning rather than an error; it is worth knowing because an install that was not refreshed after source edits goes stale and nothing else reports it. `--team` labels the shadowed skill and its roots.
+
+A declared `profile` that exists but sits **outside OMP's agent roots** also warns rather than failing, because a launcher can still read it by path (as `--system-prompt`) even though OMP will not load it as a subagent. The warning names the path so the difference is never silent.
 
 The manifest is a **thin set of references** to files that already exist. It never copies a role prompt, a skill, or project policy, and it does not replace them: repository policy files keep their authority, and Pi/OMP remains authoritative over which tools and skills actually exist at runtime. A declared capability is an intent, not a grant.
 

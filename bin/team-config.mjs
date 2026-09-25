@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 // Team composition manifest. JSON only, matching pi-link's own configuration
@@ -18,7 +19,25 @@ const MANIFEST_CANDIDATES = [
 // `key: value` scalar. Pi's own subagent tooling parses those by hand and keeps
 // a YAML library for complex nested fields only, so we follow that precedent
 // instead of taking a dependency to read four strings.
-const PROFILE_ROOTS = ['.omp/agents', '.agents'];
+// Profile roots, matching where OMP actually resolves agent definitions.
+//
+// Verified empirically against `omp` by placing a profile in each candidate and
+// asking the running agent which subagents it could see:
+//   .omp/agents/*.md              loads   (project)
+//   ~/.omp/agent/agents/*.md      loads   (user)
+//   .agents/*.md                  does NOT load
+//   .pi/agents/*.md               does NOT load
+//
+// `.agents/` appears in OMP's own source as a legacy project agent dir, so it is
+// still scanned — labelled separately, and never treated as equivalent to a real
+// OMP root. `.pi/agents/` is deliberately absent: the coding-agent package
+// declares `.pi` as its config dir, but OMP resolves agent definitions from
+// `.omp/agents`, and a directory OMP ignores must not look like a team source.
+//
+// Discovery is NOT the roster. Everything here is reported as available
+// inventory; a role joins the team only by being declared in the manifest.
+const PROJECT_PROFILE_ROOTS = ['.omp/agents', '.agents'];
+const USER_PROFILE_ROOTS = ['.omp/agent/agents'];
 const SKILL_ROOTS = ['.omp/skills', '.agents/skills', 'skills'];
 const SCRIPT_ROOT = 'scripts';
 
@@ -212,18 +231,37 @@ export async function loadTeamConfig(root) {
   return null;
 }
 
+// Read one profile's identity and the fields a launcher needs. `name` comes
+// from frontmatter when present, because that is the identity OMP registers and
+// the filename is only a fallback. `source` and `root` record where it was
+// found, so a report can distinguish a committed project profile from a
+// machine-local user one.
+async function readProfile(filePath, origin) {
+  const frontmatter = parseFrontmatter(await fs.readFile(filePath, 'utf8'));
+  const fallbackId = path.basename(filePath).replace(/\.agent\.md$|\.md$/, '');
+  return {
+    ...origin,
+    id: frontmatter.name ?? fallbackId,
+    role: frontmatter.role ?? frontmatter.type ?? frontmatter.description ?? null,
+    model: frontmatter.model ?? null,
+    skills: toStringList(frontmatter.autoloadSkills),
+  };
+}
+
 export async function discoverTeam(root) {
   const profiles = [];
-  for (const relativeRoot of PROFILE_ROOTS) {
+  for (const relativeRoot of PROJECT_PROFILE_ROOTS) {
     for (const filePath of await listFiles(path.join(root, relativeRoot), '.md')) {
-      const frontmatter = parseFrontmatter(await fs.readFile(filePath, 'utf8'));
-      profiles.push({
-        path: filePath,
-        id: path.basename(filePath).replace(/\.agent\.md$|\.md$/, ''),
-        role: frontmatter.role ?? frontmatter.type ?? null,
-        model: frontmatter.model ?? null,
-        skills: toStringList(frontmatter.autoloadSkills),
-      });
+      profiles.push(await readProfile(filePath, { path: filePath, root: relativeRoot, source: 'project' }));
+    }
+  }
+  // User-level profiles are not part of the repository, so they are labelled and
+  // never resolved against `root`. They are still worth reporting: OMP loads
+  // them, so a same-named project profile shadows one.
+  for (const relativeRoot of USER_PROFILE_ROOTS) {
+    const userRoot = path.join(os.homedir(), relativeRoot);
+    for (const filePath of await listFiles(userRoot, '.md')) {
+      profiles.push(await readProfile(filePath, { path: filePath, root: relativeRoot, source: 'user' }));
     }
   }
 
@@ -352,9 +390,24 @@ export function validateTeamConfig(config, inventory) {
   }
   const linkNames = new Map();
   const linkDirs = new Map();
+  // Profiles OMP would actually resolve, by absolute path. A declared profile
+  // outside these roots is not loaded by OMP as an agent definition; a launcher
+  // may still read it (by path, as `--system-prompt`), so this is a warning
+  // rather than an error — but it must not look like a normal team member.
+  //
+  // Tolerate a caller that supplies only file paths: without a discovery result
+  // the question is unanswerable, so it is skipped rather than answered wrongly.
+  const resolved = inventory.profiles === undefined
+    ? null
+    : new Set(inventory.profiles.map((profile) => profile.path));
   for (const [name, role] of Object.entries(config?.roles ?? {})) {
     if (!role.profile) errors.push(`roles.${name}.profile is required`);
     else if (!inventory.existingPaths.has(role.profile)) errors.push(`roles.${name}.profile is missing: ${role.profile}`);
+    else if (resolved && !resolved.has(role.profile)) {
+      warnings.push(
+        `roles.${name}.profile is outside OMP's agent roots, so OMP will not load it as a subagent (a launcher can still pass it by path): ${role.profile}`,
+      );
+    }
     // Optional launch facts: when declared, they must exist. A role that points
     // at a directory the launcher will not create is the failure this catches.
     for (const key of ['prompt', 'config']) {
@@ -398,10 +451,12 @@ export function formatTeamReport(result) {
   const lines = [];
   lines.push(`Root: ${result.root}`);
   lines.push(result.manifest ? `Manifest: ${result.manifest.manifestPath}` : 'Manifest: none');
-  lines.push(`Profiles (${result.profiles.length}):`);
+  // Inventory, not roster: these are the profiles OMP can load here. A role is on
+  // the team only by being declared in the manifest.
+  lines.push(`Profiles available (${result.profiles.length}):`);
   for (const profile of result.profiles) {
     const bits = [profile.role ? ` (${profile.role})` : '', profile.model ? ` · ${profile.model}` : ''].join('');
-    lines.push(`  ${profile.id}${bits} — ${profile.path}`);
+    lines.push(`  [${profile.source ?? 'project'}] ${profile.id}${bits} — ${profile.path}`);
   }
   lines.push(`Skills (${result.skills.length}): ${result.skills.map((skill) => skill.id).join(', ') || 'none'}`);
   // A skill found in both a source root and an install root is expected, but the

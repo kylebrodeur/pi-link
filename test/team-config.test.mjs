@@ -32,13 +32,13 @@ test('loads a JSON team manifest and normalizes role paths relative to the repos
   assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
 });
 
-test('a declared profile outside the scanned roots is not reported missing', async () => {
+test('a declared profile outside the scanned roots validates, and warns it is not OMP-resolvable', async () => {
   const root = await tempRepo();
   // A role's profile may sit beside its own session dir rather than under a
   // discovery root (`.omp/agents`). Real case: folia-app keeps
-  // `.omp/plantfluent-agents/plantfluent-pen-porter.md`. The discovery roots are
-  // a convention, not a constraint, so a declared path that exists on disk must
-  // validate.
+  // `.omp/plantfluent-agents/plantfluent-pen-porter.md`, and its launcher reads
+  // that path directly. So it must validate — but OMP would not load it as a
+  // subagent, and that difference has to be visible.
   await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
   await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
   await fs.writeFile(
@@ -55,16 +55,50 @@ test('a declared profile outside the scanned roots is not reported missing', asy
   }));
 
   const inventory = await discoverTeam(root);
-  // Discovery still does not treat it as a discoverable profile...
+  // Discovery does not treat it as a discoverable profile...
   assert.deepEqual(inventory.profiles, []);
-  // ...but the declared path is recorded as existing, so validation passes.
+  // ...so validation passes (the file exists) but says OMP will not resolve it.
   const result = validateTeamConfig(inventory.manifest, {
     existingPaths: inventory.existingPaths,
     existingDirs: inventory.existingDirs,
     skillIds: new Set(),
-    skills: []
+    skills: [],
+    profiles: inventory.profiles,
   });
   assert.deepEqual(result.errors, []);
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /outside OMP's agent roots/);
+  assert.match(result.warnings[0], /a launcher can still pass it by path/);
+});
+
+test('a profile under a real OMP root does not warn', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'agents', 'advisor.md'),
+    '---\nname: advisor\nmodel: glm-5.3\n---\nbody\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'advisor' },
+    roles: { advisor: { profile: '.omp/agents/advisor.md' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  assert.deepEqual(inventory.profiles.map((profile) => profile.id), ['advisor']);
+  assert.equal(inventory.profiles[0].source, 'project');
+
+  const result = validateTeamConfig(inventory.manifest, {
+    existingPaths: inventory.existingPaths,
+    existingDirs: inventory.existingDirs,
+    skillIds: new Set(),
+    skills: [],
+    profiles: inventory.profiles,
+  });
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.warnings, []);
 });
 
 test('a YAML manifest is not picked up, so the JSON path stays authoritative', async () => {
@@ -225,7 +259,7 @@ test('formats a concise discovery report', () => {
     skills: [{ path: '/repo/.omp/skills/workflow/SKILL.md', id: 'workflow' }],
     launchScripts: [{ path: '/repo/scripts/start-team.sh', id: 'start-team.sh' }]
   });
-  assert.match(text, /Profiles \(1\):/);
+  assert.match(text, /Profiles available \(1\):/);
   assert.match(text, /advisor.*coordinator/);
   assert.match(text, /Skills \(1\): workflow/);
   assert.match(text, /Launch scripts \(1\):/);
