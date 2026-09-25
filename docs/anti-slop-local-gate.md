@@ -90,7 +90,7 @@ All findings are in **pre-existing upstream code**. Our team work is clean.
 | File | Findings | Notes |
 |---|---|---|
 | `index.ts` | **20** | upstream, untouched by us |
-| `bin/pi-link.mjs` | **16** | upstream, all in pre-existing lines 49–701 |
+| `bin/pi-link.mjs` | **16** | upstream; none in our `--team` modes |
 | `bin/team-config.mjs` | **0** | our new code |
 | `test/team-config.test.mjs` | **0** | our new code |
 | `test/cli-team.test.mjs` | **0** | our new code |
@@ -108,10 +108,24 @@ No findings fall inside our team command block (`bin/pi-link.mjs` lines 269–31
 
 ### Consequence for the gate design
 
-Because the rules are `error`-level and upstream already carries 36 findings, the
-hook lints **only staged files**. This keeps the gate honest about *new* slop
-without blocking our fork on debt we are not introducing upstream. It is the
-lint-staged idea, reimplemented inline since pi-link has no `lint-staged`.
+Because the rules are `error`-level and upstream already carries 36 findings, linting
+whole files would block every edit to a file that has any pre-existing finding — `index.ts`
+and `bin/pi-link.mjs` both become uncommittable the moment you touch them. That is exactly
+the debt we are not introducing.
+
+So the hook lints the **staged** copy of each changed file and the **same file at HEAD**,
+then fails only on findings that are new:
+
+```sh
+comm -13 "$base_findings" "$staged_findings"   # new findings only
+```
+
+Line/column prefixes are stripped before the comparison, so moving pre-existing code
+around does not read as new slop. This is the lint-staged idea with a baseline.
+
+Verified both directions: a commit that only reorganises `bin/pi-link.mjs` (16 findings
+before and after) passes; appending a fresh `typeof` check fails with `HEAD` unmoved and
+the file still staged.
 
 ## Deviations from the standard recipe
 
@@ -122,7 +136,7 @@ pi-link has none, so:
 |---|---|
 | `eslint --fix` in lint-staged | omitted — no eslint |
 | `prettier --write` | omitted — no prettier |
-| `oxlint -c oxlint.config.ts` | **kept**, scoped to staged files |
+| `oxlint -c oxlint.config.ts` | **kept**, but baseline-aware (staged vs HEAD) rather than whole-file |
 | `npm run typecheck` | replaced with `node --test test/*.test.mjs` — no typecheck script exists |
 
 ## The trufflehog index bug (important)
