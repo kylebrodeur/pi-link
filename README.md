@@ -422,17 +422,29 @@ pi-link --team-check     # validate the declared manifest; exit 1 on errors
 
 It is **read-only**: it reads directory trees and reports, and never writes a file, starts a terminal, or changes any link state. The natural fear — a tool that mutates a repo — does not apply here.
 
-**What it discovers.** Existing artifacts, rather than owning new ones: agent profiles under `.omp/agents/` (project) and `.omp/agent/agents/` (user), skills in `.omp/skills/`, `.agents/skills/` and `skills/`, and launch scripts in `scripts/`. Profile frontmatter supplies the name, role, model, and autoloaded skills.
+**What it discovers.** Existing artifacts, rather than owning new ones: agent profiles under `.omp/agents/` and `.pi/agents/` (project) and `~/.omp/agent/agents/`, `~/.pi/agent/agents/` (user), skills in `.omp/skills/`, `.agents/skills/` and `skills/`, and launch scripts in `scripts/`. Profile frontmatter supplies the name, role, model, and autoloaded skills.
 
-Profiles are **inventory, not roster.** Everything OMP can load is listed, labelled `[project]` or `[user]`; a role joins the team only by being declared in the manifest. `.agents/` is scanned too, but as a legacy location — verified: OMP does **not** load agent definitions from `.agents/*.md` or `.pi/agents/*.md`, only from `.omp/agents` and `~/.omp/agent/agents`.
+**Two harnesses, two config dirs.** OMP and Pi read agent definitions from *different* roots, and a profile loads only in the harness whose root it sits in:
+
+| Root | OMP | Pi |
+|---|---|---|
+| `.omp/agents/`, `~/.omp/agent/agents/` | yes | no |
+| `.pi/agents/`, `~/.pi/agent/agents/` | no | yes |
+| `.agents/` (project and user) | no | yes (legacy) |
+
+`.agents/` is pi-subagents' legacy agent dir, so Pi still loads profiles from it. OMP *does* read `.agents` — but only for skills, rules, prompts, commands and `AGENTS.md`, never for agent definitions. That asymmetry is why each profile is labelled with the harness that resolves it (`[project omp]`, `[project pi]`) rather than a bare `[project]`, which would imply both load it.
+
+Profiles are **inventory, not roster.** Everything either harness can load is listed; a role joins the team only by being declared in the manifest.
+
+**A profile in the right root can still never load.** Both harnesses skip any file whose frontmatter lacks `name` **or** `description` — pi-subagents does it outright, and OMP behaves the same (a name-only profile in `.omp/agents` does not appear in `omp --print`'s subagent list, while an identical one with a `description` does). So a correct path is not the same as a registered agent. `--team` marks such a profile `(INERT: missing description)`, and `--team-check` warns when a declared role points at one, because that failure is invisible from the path alone.
 
 ```
 $ pi-link --team
 Root: ~/my-project
 Manifest: ~/my-project/.pi-link/team.json
 Profiles available (2):
-  [project] advisor (coordinator) · glm-5.2:cloud — ~/my-project/.omp/agents/advisor.md
-  [project] builder (member) · kimi-k2.7-code:cloud — ~/my-project/.omp/agents/builder.md
+  [project omp] advisor (coordinator) · glm-5.2:cloud — ~/my-project/.omp/agents/advisor.md
+  [project pi] builder (member) · kimi-k2.7-code:cloud — ~/my-project/.pi/agents/builder.md
 Skills (1): team-workflow
 Launch scripts (1):
   start-team.sh — ~/my-project/scripts/start-team.sh
@@ -465,7 +477,7 @@ Hub role: advisor
 
 It also warns when a skill id appears in more than one skill root — the same skill present in both the tracked source (`skills/`) and a local install (`.agents/skills/`, typically gitignored alongside `skills-lock.json`). That pair is the normal source-to-install relationship, so it is a warning rather than an error; it is worth knowing because an install that was not refreshed after source edits goes stale and nothing else reports it. `--team` labels the shadowed skill and its roots.
 
-A declared `profile` that exists but sits **outside OMP's agent roots** also warns rather than failing, because a launcher can still read it by path (as `--system-prompt`) even though OMP will not load it as a subagent. The warning names the path so the difference is never silent.
+A declared `profile` that exists but sits **outside every harness's agent roots** also warns rather than failing, because a launcher can still read it by path (as `--system-prompt`) even though neither harness will load it as a subagent. The warning names the path so the difference is never silent. A profile in a Pi-only root (`.pi/agents`, `.agents`) does not warn: it is loadable, just by Pi.
 
 The manifest is a **thin set of references** to files that already exist. It never copies a role prompt, a skill, or project policy, and it does not replace them: repository policy files keep their authority, and Pi/OMP remains authoritative over which tools and skills actually exist at runtime. A declared capability is an intent, not a grant.
 

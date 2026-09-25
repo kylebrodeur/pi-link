@@ -10,13 +10,15 @@ Use this skill when a user asks to discover, define, validate, or start a local 
 ## Principles
 
 - Inspect before proposing changes.
-- Reuse existing `.omp/agents/`, `.agents/`, `.omp/skills/`, `skills/`, and `scripts/` artifacts.
+- Reuse existing `.omp/agents/`, `.pi/agents/`, `.agents/`, `.omp/skills/`, `skills/`, and `scripts/` artifacts.
+- Remember the harness split: OMP loads profiles from `.omp/agents/`, Pi from `.pi/agents/` and the legacy `.agents/`. A profile only registers in the harness whose root it sits in, and `--team` labels each with the harness that resolves it.
 - Treat repository policy files such as `AGENTS.md`, handoff docs, and ownership records as authoritative project policy.
 - Treat `.pi-link/team.json` as a composition manifest, not a replacement for role prompts or project policy.
 - Never overwrite an existing manifest, profile, skill, or launcher without explicit approval.
 - Group names scope normal pi-link visibility and routing; they are not authentication.
 - A declared coordinator/hub role is a startup convention until the runtime enforces it.
 - A capability request cannot grant a tool that Pi/OMP does not expose.
+- A profile needs both `name` and `description` in frontmatter to register at all; without them it is inert no matter how correct its path is. `--team` marks these `(INERT: …)` and `--team-check` warns when a declared role points at one.
 
 ## Discovery workflow
 

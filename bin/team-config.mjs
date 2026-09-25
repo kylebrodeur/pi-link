@@ -19,25 +19,42 @@ const MANIFEST_CANDIDATES = [
 // `key: value` scalar. Pi's own subagent tooling parses those by hand and keeps
 // a YAML library for complex nested fields only, so we follow that precedent
 // instead of taking a dependency to read four strings.
-// Profile roots, matching where OMP actually resolves agent definitions.
+// Profile roots, by the harness that actually resolves them.
 //
-// Verified empirically against `omp` by placing a profile in each candidate and
-// asking the running agent which subagents it could see:
-//   .omp/agents/*.md              loads   (project)
-//   ~/.omp/agent/agents/*.md      loads   (user)
-//   .agents/*.md                  does NOT load
-//   .pi/agents/*.md               does NOT load
+// Two harnesses read agent definitions, out of *different* config dirs, and a
+// profile is only loadable by the harness whose dir it sits in. Verified by
+// placing a profile in each candidate and asking that harness to list its
+// subagents — `omp --print` for OMP, pi-subagents' own resolver for Pi (Pi's
+// subagent package is configDir-driven, reading the running harness's
+// `piConfig.configDir`):
 //
-// `.agents/` appears in OMP's own source as a legacy project agent dir, so it is
-// still scanned — labelled separately, and never treated as equivalent to a real
-// OMP root. `.pi/agents/` is deliberately absent: the coding-agent package
-// declares `.pi` as its config dir, but OMP resolves agent definitions from
-// `.omp/agents`, and a directory OMP ignores must not look like a team source.
+//   project              OMP   Pi     user                        OMP   Pi
+//   .omp/agents/*.md     yes   no     ~/.omp/agent/agents/*.md    yes   no
+//   .pi/agents/*.md      no    yes    ~/.pi/agent/agents/*.md     no    yes
+//   .agents/*.md         no    yes    ~/.agents/*.md              no    yes
+//
+// `.agents/` is pi-subagents' legacy agent dir, so Pi still reads profiles from
+// it. OMP *does* read `.agents` — but only for skills, rules, prompts, commands
+// and AGENTS.md, never for agent definitions. That asymmetry is exactly why
+// `.agents` cannot be reported as a plain "loadable" root, and why the harness
+// is recorded per profile: "resolvable" is a question about one harness, not
+// about the filesystem.
+//
+// OMP's own binary contains no `.pi/agents` literal at all and declares `.omp`
+// as its config dir, so OMP never resolves `.pi/agents`.
 //
 // Discovery is NOT the roster. Everything here is reported as available
 // inventory; a role joins the team only by being declared in the manifest.
-const PROJECT_PROFILE_ROOTS = ['.omp/agents', '.agents'];
-const USER_PROFILE_ROOTS = ['.omp/agent/agents'];
+const PROJECT_PROFILE_ROOTS = [
+  { path: '.omp/agents', harness: 'omp' },
+  { path: '.pi/agents', harness: 'pi' },
+  { path: '.agents', harness: 'pi', legacy: true },
+];
+const USER_PROFILE_ROOTS = [
+  { path: '.omp/agent/agents', harness: 'omp' },
+  { path: '.pi/agent/agents', harness: 'pi' },
+  { path: '.agents', harness: 'pi', legacy: true },
+];
 const SKILL_ROOTS = ['.omp/skills', '.agents/skills', 'skills'];
 const SCRIPT_ROOT = 'scripts';
 
@@ -232,36 +249,68 @@ export async function loadTeamConfig(root) {
 }
 
 // Read one profile's identity and the fields a launcher needs. `name` comes
-// from frontmatter when present, because that is the identity OMP registers and
-// the filename is only a fallback. `source` and `root` record where it was
-// found, so a report can distinguish a committed project profile from a
-// machine-local user one.
+// from frontmatter when present, because that is the identity the harness
+// registers and the filename is only a fallback. `source`, `root` and `harness`
+// record where it was found, so a report can distinguish a committed project
+// profile from a machine-local user one and say which harness would load it.
+//
+// `loadable` mirrors the gate both harnesses apply before registering a
+// profile: pi-subagents skips any file whose frontmatter lacks `name` or
+// `description` (`if (!frontmatter.name || !frontmatter.description) continue`),
+// and OMP behaves the same — verified by placing a name-only profile in
+// `.omp/agents` and asking `omp --print` to list its subagents: it does not
+// appear, while the same file with a `description` does. A profile in a correct
+// root can therefore still be invisible, which is exactly the confusing case
+// this flag makes visible. The filename fallback below is for reporting only; it
+// never makes an unloadable file loadable.
 async function readProfile(filePath, origin) {
   const frontmatter = parseFrontmatter(await fs.readFile(filePath, 'utf8'));
   const fallbackId = path.basename(filePath).replace(/\.agent\.md$|\.md$/, '');
-  return {
+  const loadable = Boolean(frontmatter.name && frontmatter.description);
+  const profile = {
     ...origin,
     id: frontmatter.name ?? fallbackId,
     role: frontmatter.role ?? frontmatter.type ?? frontmatter.description ?? null,
     model: frontmatter.model ?? null,
     skills: toStringList(frontmatter.autoloadSkills),
+    loadable,
   };
+  // Why it will not register, so the report can say it rather than leaving the
+  // reader to infer it from a missing field.
+  if (!loadable) {
+    if (!frontmatter.name && !frontmatter.description) profile.notLoadableBecause = 'missing name and description';
+    else if (!frontmatter.name) profile.notLoadableBecause = 'missing name';
+    else profile.notLoadableBecause = 'missing description';
+  }
+  return profile;
 }
 
 export async function discoverTeam(root) {
   const profiles = [];
-  for (const relativeRoot of PROJECT_PROFILE_ROOTS) {
-    for (const filePath of await listFiles(path.join(root, relativeRoot), '.md')) {
-      profiles.push(await readProfile(filePath, { path: filePath, root: relativeRoot, source: 'project' }));
+  for (const rootSpec of PROJECT_PROFILE_ROOTS) {
+    for (const filePath of await listFiles(path.join(root, rootSpec.path), '.md')) {
+      profiles.push(await readProfile(filePath, {
+        path: filePath,
+        root: rootSpec.path,
+        source: 'project',
+        harness: rootSpec.harness,
+        legacy: rootSpec.legacy ?? false,
+      }));
     }
   }
   // User-level profiles are not part of the repository, so they are labelled and
-  // never resolved against `root`. They are still worth reporting: OMP loads
-  // them, so a same-named project profile shadows one.
-  for (const relativeRoot of USER_PROFILE_ROOTS) {
-    const userRoot = path.join(os.homedir(), relativeRoot);
+  // never resolved against `root`. They are still worth reporting: a harness
+  // loads them, so a same-named project profile shadows one.
+  for (const rootSpec of USER_PROFILE_ROOTS) {
+    const userRoot = path.join(os.homedir(), rootSpec.path);
     for (const filePath of await listFiles(userRoot, '.md')) {
-      profiles.push(await readProfile(filePath, { path: filePath, root: relativeRoot, source: 'user' }));
+      profiles.push(await readProfile(filePath, {
+        path: filePath,
+        root: rootSpec.path,
+        source: 'user',
+        harness: rootSpec.harness,
+        legacy: rootSpec.legacy ?? false,
+      }));
     }
   }
 
@@ -390,22 +439,39 @@ export function validateTeamConfig(config, inventory) {
   }
   const linkNames = new Map();
   const linkDirs = new Map();
-  // Profiles OMP would actually resolve, by absolute path. A declared profile
-  // outside these roots is not loaded by OMP as an agent definition; a launcher
-  // may still read it (by path, as `--system-prompt`), so this is a warning
-  // rather than an error — but it must not look like a normal team member.
+  // Profile paths each harness would actually resolve. "Resolvable" is a
+  // question about one harness, not about the filesystem: `.omp/agents` is
+  // OMP-only, `.pi/agents` and `.agents` are Pi-only. A declared profile outside
+  // every root is not loaded by either as an agent definition; a launcher may
+  // still read it (by path, as `--system-prompt`), so this is a warning rather
+  // than an error — but it must not look like a normal team member.
   //
   // Tolerate a caller that supplies only file paths: without a discovery result
   // the question is unanswerable, so it is skipped rather than answered wrongly.
-  const resolved = inventory.profiles === undefined
+  const resolvableBy = inventory.profiles === undefined
     ? null
-    : new Set(inventory.profiles.map((profile) => profile.path));
+    : new Map(inventory.profiles.map((profile) => [profile.path, profile.harness]));
+  // A profile in a correct root can still fail to register when its frontmatter
+  // lacks `name` or `description`. That is the silent one: the path exists, the
+  // root is right, and the agent still never appears. Warn, because a declared
+  // role that cannot register is a composition bug a launcher cannot see.
+  const inertProfiles = inventory.profiles === undefined
+    ? null
+    : new Map(
+      inventory.profiles
+        .filter((profile) => profile.loadable === false)
+        .map((profile) => [profile.path, profile.notLoadableBecause]),
+    );
   for (const [name, role] of Object.entries(config?.roles ?? {})) {
     if (!role.profile) errors.push(`roles.${name}.profile is required`);
     else if (!inventory.existingPaths.has(role.profile)) errors.push(`roles.${name}.profile is missing: ${role.profile}`);
-    else if (resolved && !resolved.has(role.profile)) {
+    else if (resolvableBy && !resolvableBy.has(role.profile)) {
       warnings.push(
-        `roles.${name}.profile is outside OMP's agent roots, so OMP will not load it as a subagent (a launcher can still pass it by path): ${role.profile}`,
+        `roles.${name}.profile is outside every harness's agent roots, so it will not load as a subagent (a launcher can still pass it by path): ${role.profile}`,
+      );
+    } else if (inertProfiles?.has(role.profile)) {
+      warnings.push(
+        `roles.${name}.profile is in a loadable root but its frontmatter is ${inertProfiles.get(role.profile)}, so no harness will register it: ${role.profile}`,
       );
     }
     // Optional launch facts: when declared, they must exist. A role that points
@@ -456,7 +522,14 @@ export function formatTeamReport(result) {
   lines.push(`Profiles available (${result.profiles.length}):`);
   for (const profile of result.profiles) {
     const bits = [profile.role ? ` (${profile.role})` : '', profile.model ? ` · ${profile.model}` : ''].join('');
-    lines.push(`  [${profile.source ?? 'project'}] ${profile.id}${bits} — ${profile.path}`);
+    // Name the harness that resolves this root: `.omp/agents` is OMP-only and
+    // `.pi/agents` is Pi-only, so "[project]" alone would imply both load it.
+    const loadable = profile.harness ? ` ${profile.harness}` : '';
+    const legacy = profile.legacy ? ', legacy' : '';
+    // A profile in a correct root still does not register without name+
+    // description, so say so here rather than listing it as if it were usable.
+    const inert = profile.loadable === false ? `  (INERT: ${profile.notLoadableBecause})` : '';
+    lines.push(`  [${profile.source ?? 'project'}${legacy}${loadable}] ${profile.id}${bits} — ${profile.path}${inert}`);
   }
   lines.push(`Skills (${result.skills.length}): ${result.skills.map((skill) => skill.id).join(', ') || 'none'}`);
   // A skill found in both a source root and an install root is expected, but the

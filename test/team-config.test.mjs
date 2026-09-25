@@ -32,7 +32,7 @@ test('loads a JSON team manifest and normalizes role paths relative to the repos
   assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
 });
 
-test('a declared profile outside the scanned roots validates, and warns it is not OMP-resolvable', async () => {
+test('a declared profile outside every harness root validates, and warns it will not load', async () => {
   const root = await tempRepo();
   // A role's profile may sit beside its own session dir rather than under a
   // discovery root (`.omp/agents`). Real case: folia-app keeps
@@ -67,7 +67,7 @@ test('a declared profile outside the scanned roots validates, and warns it is no
   });
   assert.deepEqual(result.errors, []);
   assert.equal(result.warnings.length, 1);
-  assert.match(result.warnings[0], /outside OMP's agent roots/);
+  assert.match(result.warnings[0], /outside every harness's agent roots/);
   assert.match(result.warnings[0], /a launcher can still pass it by path/);
 });
 
@@ -77,7 +77,7 @@ test('a profile under a real OMP root does not warn', async () => {
   await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
   await fs.writeFile(
     path.join(root, '.omp', 'agents', 'advisor.md'),
-    '---\nname: advisor\nmodel: glm-5.3\n---\nbody\n',
+    '---\nname: advisor\ndescription: coordinates\nmodel: glm-5.3\n---\nbody\n',
   );
   await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
     version: 1,
@@ -99,6 +99,40 @@ test('a profile under a real OMP root does not warn', async () => {
   });
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.warnings, []);
+});
+
+// Pi resolves `.pi/agents` and pi-subagents' legacy `.agents`; OMP resolves
+// neither. A profile there IS loadable, just by the other harness, so it must
+// not warn — warning would claim nothing loads it, which is false.
+test('a Pi-resolvable root does not warn, because Pi loads it', async () => {
+  for (const dir of ['.pi/agents', '.agents']) {
+    const root = await tempRepo();
+    await fs.mkdir(path.join(root, dir), { recursive: true });
+    await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+    await fs.writeFile(
+      path.join(root, dir, 'builder.md'),
+      '---\nname: builder\ndescription: member\nmodel: kimi-k2.7-code\n---\nbody\n',
+    );
+    await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+      version: 1,
+      team: { name: 'demo', group: 'demo' },
+      hub: { role: 'builder' },
+      roles: { builder: { profile: `${dir}/builder.md` } }
+    }));
+
+    const inventory = await discoverTeam(root);
+    assert.deepEqual(inventory.profiles.map((p) => p.id), ['builder'], dir);
+
+    const result = validateTeamConfig(inventory.manifest, {
+      existingPaths: inventory.existingPaths,
+      existingDirs: inventory.existingDirs,
+      skillIds: new Set(),
+      skills: [],
+      profiles: inventory.profiles,
+    });
+    assert.deepEqual(result.errors, [], dir);
+    assert.deepEqual(result.warnings, [], dir);
+  }
 });
 
 test('a YAML manifest is not picked up, so the JSON path stays authoritative', async () => {
@@ -143,6 +177,79 @@ test('discovers profiles, skills, and launch scripts without writing files', asy
   ].sort());
   assert.deepEqual(result.skills.map((entry) => entry.id), ['workflow']);
   assert.deepEqual(result.launchScripts.map((entry) => entry.path), [path.join(root, 'scripts', 'start-team.sh')]);
+});
+
+// The harness matters: OMP resolves `.omp/agents`, Pi resolves `.pi/agents`, and
+// `.agents` is pi-subagents' legacy dir (Pi-only for profiles — OMP reads it for
+// skills/rules/prompts, never agent definitions). A report that said only
+// "[project]" would imply every harness loads every profile.
+test('records which harness resolves each profile root', async () => {
+  const root = await tempRepo();
+  for (const dir of ['.omp/agents', '.pi/agents', '.agents']) {
+    await fs.mkdir(path.join(root, dir), { recursive: true });
+    await fs.writeFile(path.join(root, dir, 'role.md'), `---\nname: ${dir.replace(/\W/g, '')}\ndescription: d\n---\n`);
+  }
+
+  const result = await discoverTeam(root);
+  const byRoot = new Map(result.profiles.map((p) => [p.root, p]));
+  assert.equal(byRoot.get('.omp/agents').harness, 'omp');
+  assert.equal(byRoot.get('.pi/agents').harness, 'pi');
+  assert.equal(byRoot.get('.agents').harness, 'pi');
+  assert.equal(byRoot.get('.agents').legacy, true);
+  assert.equal(byRoot.get('.omp/agents').legacy, false);
+});
+
+// A profile in a correct root still does not register without `name` AND
+// `description`: pi-subagents skips such files outright, and OMP does the same
+// (verified against the real binary — a name-only profile is absent from the
+// subagent list while an otherwise identical one with a description appears).
+// The path existing is not the same as the agent existing.
+test('marks a profile inert when its frontmatter lacks name or description', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'ok.md'), '---\nname: ok\ndescription: d\n---\n');
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'nodesc.md'), '---\nname: nodesc\n---\n');
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'noname.md'), '---\ndescription: d\n---\n');
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'neither.md'), '---\nrole: member\n---\n');
+
+  const result = await discoverTeam(root);
+  const byId = new Map(result.profiles.map((p) => [p.id, p]));
+  assert.equal(byId.get('ok').loadable, true);
+  assert.equal(byId.get('ok').notLoadableBecause, undefined);
+  assert.equal(byId.get('nodesc').loadable, false);
+  assert.equal(byId.get('nodesc').notLoadableBecause, 'missing description');
+  assert.equal(byId.get('noname').loadable, false);
+  assert.equal(byId.get('noname').notLoadableBecause, 'missing name');
+  assert.equal(byId.get('neither').loadable, false);
+  assert.equal(byId.get('neither').notLoadableBecause, 'missing name and description');
+});
+
+// A declared role pointing at an inert profile is a composition bug the launcher
+// cannot see: the file exists and the root is right, yet no agent registers.
+test('warns when a declared role points at an inert profile', async () => {
+  const root = await tempRepo();
+  await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(path.join(root, '.omp', 'agents', 'quiet.md'), '---\nname: quiet\n---\n');
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'quiet' },
+    roles: { quiet: { profile: '.omp/agents/quiet.md' } }
+  }));
+
+  const inventory = await discoverTeam(root);
+  const result = validateTeamConfig(inventory.manifest, {
+    existingPaths: inventory.existingPaths,
+    existingDirs: inventory.existingDirs,
+    skillIds: new Set(),
+    skills: [],
+    profiles: inventory.profiles,
+  });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /missing description/);
+  assert.match(result.warnings[0], /no harness will register it/);
 });
 
 test('does not treat skill reference documents as profiles', async () => {
@@ -255,12 +362,18 @@ test('formats a concise discovery report', () => {
   const text = formatTeamReport({
     root: '/repo',
     manifest: null,
-    profiles: [{ path: '/repo/.omp/agents/advisor.md', id: 'advisor', role: 'coordinator' }],
+    profiles: [
+      { path: '/repo/.omp/agents/advisor.md', id: 'advisor', role: 'coordinator', source: 'project', harness: 'omp', legacy: false },
+      { path: '/repo/.agents/old.md', id: 'old', role: null, source: 'project', harness: 'pi', legacy: true }
+    ],
     skills: [{ path: '/repo/.omp/skills/workflow/SKILL.md', id: 'workflow' }],
     launchScripts: [{ path: '/repo/scripts/start-team.sh', id: 'start-team.sh' }]
   });
-  assert.match(text, /Profiles available \(1\):/);
+  assert.match(text, /Profiles available \(2\):/);
   assert.match(text, /advisor.*coordinator/);
+  // The harness is named, because OMP and Pi resolve different roots.
+  assert.match(text, /\[project omp\] advisor/);
+  assert.match(text, /\[project, legacy pi\] old/);
   assert.match(text, /Skills \(1\): workflow/);
   assert.match(text, /Launch scripts \(1\):/);
 });
