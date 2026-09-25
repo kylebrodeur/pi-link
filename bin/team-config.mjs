@@ -227,12 +227,19 @@ export async function discoverTeam(root) {
     }
   }
 
+  // `root` is recorded so a report can tell a tracked source skill from a local
+  // install. Install roots are conventionally gitignored, so the distinction is
+  // not visible from the path alone.
   const skills = [];
   for (const relativeRoot of SKILL_ROOTS) {
     for (const filePath of await walkFiles(path.join(root, relativeRoot), 'SKILL.md')) {
       const relativeRootPath = path.join(root, relativeRoot);
       const parts = path.relative(relativeRootPath, filePath).split(path.sep);
-      skills.push({ path: filePath, id: parts.length > 1 ? parts[0] : path.basename(path.dirname(filePath)) });
+      skills.push({
+        path: filePath,
+        root: relativeRoot,
+        id: parts.length > 1 ? parts[0] : path.basename(path.dirname(filePath)),
+      });
     }
   }
 
@@ -287,6 +294,23 @@ export async function discoverTeam(root) {
   };
 }
 
+// Skill ids discovered in more than one root. Skill roots span both tracked
+// source (`skills/`) and local installs (`.agents/skills/`, typically gitignored
+// alongside `skills-lock.json`), so a repeat is normally an installed copy of a
+// source skill rather than an ambiguity. It is still worth surfacing: an install
+// that was not refreshed after source edits goes stale, and nothing else says so.
+function shadowedSkillIds(skills) {
+  const byId = new Map();
+  for (const skill of skills) {
+    const entries = byId.get(skill.id) ?? [];
+    entries.push(skill);
+    byId.set(skill.id, entries);
+  }
+  return [...byId.entries()]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([id, entries]) => ({ id, roots: entries.map((entry) => entry.root) }));
+}
+
 export function validateTeamConfig(config, inventory) {
   const errors = [];
   const warnings = [];
@@ -300,6 +324,16 @@ export function validateTeamConfig(config, inventory) {
   if (!config?.hub?.role) errors.push('hub.role is required');
   else if (!config.roles?.[config.hub.role]) {
     errors.push(`hub.role "${config.hub.role}" does not name a configured role`);
+  }
+  // Skill roots include both tracked source (`skills/`) and local installs
+  // (`.agents/skills/`, typically gitignored alongside `skills-lock.json`). The
+  // same id in both is the normal source-to-install relationship, not an
+  // ambiguity — but a stale install can shadow source edits, and nothing else
+  // reports that, so surface it without claiming which one wins.
+  for (const shadowed of shadowedSkillIds(inventory.skills ?? [])) {
+    warnings.push(
+      `skill "${shadowed.id}" appears in ${shadowed.roots.length} skill roots, so an installed copy may shadow source edits: ${shadowed.roots.join(', ')}`,
+    );
   }
   const linkNames = new Map();
   const linkDirs = new Map();
@@ -355,6 +389,11 @@ export function formatTeamReport(result) {
     lines.push(`  ${profile.id}${bits} — ${profile.path}`);
   }
   lines.push(`Skills (${result.skills.length}): ${result.skills.map((skill) => skill.id).join(', ') || 'none'}`);
+  // A skill found in both a source root and an install root is expected, but the
+  // repeat is invisible in the flat list above, so name the roots explicitly.
+  for (const entry of shadowedSkillIds(result.skills)) {
+    lines.push(`  shadowed: ${entry.id} — found in ${entry.roots.join(', ')}`);
+  }
   if (result.sessionConfigs?.length) {
     lines.push(`Session configs: ${result.sessionConfigs.map((config) => config.id).join(', ')}`);
   }

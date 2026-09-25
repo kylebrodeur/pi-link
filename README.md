@@ -459,7 +459,9 @@ Hub role: advisor
 }
 ```
 
-`--team-check` verifies that every referenced profile, prompt and config file exists, that required skills are present, that `hub.role` names a real role, and that declared terminal names do not collide. Required errors exit `1` and print `ERROR …`; optional problems print `WARN …` and exit `0`, so a missing optional skill is never presented as a startup failure.
+`--team-check` verifies that every referenced profile, prompt and config file exists, that required skills are present, that `hub.role` names a real role, that declared terminal names do not collide, and that no two roles share a session directory. Required errors exit `1` and print `ERROR …`; optional problems print `WARN …` and exit `0`, so a missing optional skill is never presented as a startup failure.
+
+It also warns when a skill id appears in more than one skill root — the same skill present in both the tracked source (`skills/`) and a local install (`.agents/skills/`, typically gitignored alongside `skills-lock.json`). That pair is the normal source-to-install relationship, so it is a warning rather than an error; it is worth knowing because an install that was not refreshed after source edits goes stale and nothing else reports it. `--team` labels the shadowed skill and its roots.
 
 The manifest is a **thin set of references** to files that already exist. It never copies a role prompt, a skill, or project policy, and it does not replace them: repository policy files keep their authority, and Pi/OMP remains authoritative over which tools and skills actually exist at runtime. A declared capability is an intent, not a grant.
 

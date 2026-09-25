@@ -154,6 +154,34 @@ test('requires a hub role even when no hub mode is declared', () => {
   assert.deepEqual(result.errors, ['hub.role is required']);
 });
 
+// A skill in both a source root and an install root is the normal
+// source-to-install relationship, so it is a warning, not an error: it matters
+// only when the install is stale and shadows source edits.
+test('warns when a skill id appears in more than one root', () => {
+  const result = validateTeamConfig({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'worker' },
+    roles: {
+      worker: { role: 'member', profile: '/present.md' }
+    }
+  }, {
+    existingPaths: new Set(['/present.md']),
+    skillIds: new Set(['workflow']),
+    skills: [
+      { id: 'workflow', root: '.agents/skills', path: '/repo/.agents/skills/workflow/SKILL.md' },
+      { id: 'workflow', root: 'skills', path: '/repo/skills/workflow/SKILL.md' },
+      { id: 'other', root: 'skills', path: '/repo/skills/other/SKILL.md' }
+    ]
+  });
+
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.warnings, [
+    'skill "workflow" appears in 2 skill roots, so an installed copy may shadow source edits: '
+    + '.agents/skills, skills'
+  ]);
+});
+
 test('formats a concise discovery report', () => {
   const text = formatTeamReport({
     root: '/repo',
