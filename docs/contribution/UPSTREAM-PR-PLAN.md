@@ -13,7 +13,7 @@ Neither needs a maintainer answer before review. Both are contained changes to r
 
 ## What would be contributed
 
-Current branch diff vs `master` (11 commits):
+Current branch diff vs `upstream/master` (see `git diff --stat upstream/master..HEAD`):
 
 | File | Status | Notes |
 |---|---|---|
@@ -23,16 +23,28 @@ Current branch diff vs `master` (11 commits):
 | `test/team-config.test.mjs` | new | discovery + validation coverage |
 | `test/cli-team.test.mjs` | new | CLI surface, including the session-name collision regression |
 | `test/fixtures/.pi-link/team.json` | new | fixture |
-| `package.json` | **unchanged** | no dependency added — JSON-only (see decision 2) |
-| `package-lock.json` | **unchanged** | no dependency added |
+| `README.md` | modified | new `## Teams` section + ToC entry |
+| `CHANGELOG.md` | modified | 0.6.0 entry in upstream's prose style |
+| `package.json` | modified | **version bump only** — no dependency added (JSON-only, see decision 2) |
+| `package-lock.json` | modified | version bump |
 | `docs/pi-link-team-setup-runbook.md` | new | **do not send** — internal runbook |
+| `docs/pi-link-team-migration.md` | new | **do not send** — internal, our conventions |
 | `docs/superpowers/plans/…` | new | **do not send** — internal plan |
+
+The version number in the PR is a proposal; upstream may prefer to set their own.
 
 ### Files to exclude from the PR
 
-`docs/pi-link-team-setup-runbook.md` and `docs/superpowers/plans/2026-09-24-*.md` are internal
-working documents (they reference local checkout paths, the local anti-slop gate, and our
-fork's install isolation). They should not go upstream.
+These are internal working documents and must **not** go upstream:
+
+| File | Why |
+|---|---|
+| `docs/pi-link-team-setup-runbook.md` | references local checkout paths, the local anti-slop gate, and our fork's install isolation |
+| `docs/pi-link-team-migration.md` | written for **our own** teams and layout conventions (Zellij launcher pattern, our skill roots); upstream has none of this context |
+| `docs/superpowers/plans/2026-09-24-*.md` | our internal implementation plan |
+
+`docs/anti-slop-local-gate.md` is also ours (it documents a checkout-local gate
+upstream does not have) but is harmless; decide separately if it goes.
 
 ## Upstream conventions to match
 
@@ -76,7 +88,8 @@ Plus, in the same commit:
 git fetch upstream && git merge-base --is-ancestor upstream/master HEAD
 
 # 2. internal docs excluded
-git diff --name-only upstream/master..HEAD | grep -E 'docs/(superpowers|pi-link-team-setup-runbook)' \
+git diff --name-only upstream/master..HEAD \
+  | grep -E 'docs/(superpowers|pi-link-team-setup-runbook|pi-link-team-migration|anti-slop-local-gate)' \
   && echo 'EXCLUDE THESE' || echo 'clean'
 
 # 3. tests pass
