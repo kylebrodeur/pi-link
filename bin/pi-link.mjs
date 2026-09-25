@@ -266,56 +266,6 @@ function renderTable(rows, columns) {
 // ── CLI ────────────────────────────────────────────────────────────────────
 
 const rawArgs = process.argv.slice(2);
-const teamIndex = rawArgs.indexOf("team");
-if (teamIndex === 0) {
-  const subcommand = rawArgs[1];
-  if (!["discover", "show", "check", "explain"].includes(subcommand) || rawArgs.length !== 2) {
-    console.error("Usage: pi-link team discover|show|check|explain");
-    process.exit(64);
-  }
-  let inventory;
-  try {
-    inventory = await discoverTeam(process.cwd());
-  } catch (error) {
-    // A malformed manifest is a user error, not a crash: report it and exit nonzero.
-    console.error(`ERROR failed to read team manifest: ${error.message}`);
-    process.exit(1);
-  }
-  if (subcommand === "discover" || subcommand === "explain") console.log(formatTeamReport(inventory));
-  if (subcommand === "show") {
-    console.log(formatTeamReport(inventory));
-    if (inventory.manifest) {
-      console.log(`\nTeam: ${inventory.manifest.team?.name ?? "unnamed"}`);
-      console.log(`Group: ${inventory.manifest.team?.group ?? "unset"}`);
-      console.log(`Hub role: ${inventory.manifest.hub?.role ?? "unset"}`);
-      for (const [name, role] of Object.entries(inventory.manifest.roles ?? {})) {
-        console.log(`  ${name}${role.role ? ` (${role.role})` : ""}${role.linkName ? ` → ${role.linkName}` : ""}`);
-      }
-    }
-  }
-  if (subcommand === "check") {
-    if (!inventory.manifest) {
-      console.error("No team manifest found. Expected .pi-link/team.json.");
-      process.exit(1);
-    }
-    const result = validateTeamConfig(inventory.manifest, {
-      // A declared prompt/config is a file; a declared cwd/sessionDir is a
-      // directory. Both must already exist, so a manifest cannot promise a
-      // location the launcher would have to invent.
-      existingPaths: new Set([
-        ...inventory.profiles.map((profile) => profile.path),
-        ...inventory.sessionConfigs.map((config) => config.path),
-      ]),
-      existingDirs: inventory.existingDirs,
-      skillIds: new Set(inventory.skills.map((skill) => skill.id)),
-    });
-    for (const error of result.errors) console.error(`ERROR ${error}`);
-    for (const warning of result.warnings) console.error(`WARN ${warning}`);
-    if (result.errors.length) process.exit(1);
-    console.log(`Team manifest valid: ${inventory.manifest.manifestPath}`);
-  }
-  process.exit(0);
-}
 
 // Reject Pi flags that pi-link manages, plus --link-name (which exists at the
 // `pi` level for link-only naming, but the wrapper's combined-mode contract
@@ -358,7 +308,8 @@ function printHelp() {
   console.error("       pi-link --list [--global|-g]");
   console.error("       pi-link --status [--json]");
   console.error("       pi-link --resolve <name> [--global|-g]");
-  console.error("       pi-link team discover|show|check|explain");
+  console.error("       pi-link --team [--json]");
+  console.error("       pi-link --team-check");
   console.error("       pi-link --version");
   console.error("");
   console.error("By default, name lookup is scoped to the current cwd.");
@@ -384,6 +335,8 @@ function describeMode(mode) {
     case "list": return "--list";
     case "status": return "--status";
     case "resolve": return "--resolve";
+    case "team": return "--team";
+    case "team-check": return "--team-check";
     case "launcher": return "session name";
     default: return mode;
   }
@@ -399,7 +352,7 @@ function describeMode(mode) {
 //   5. Launcher passthrough (mode launcher) with orphan-positional rejection
 
 const state = {
-  mode: null, // null | "help" | "version" | "list" | "status" | "resolve" | "launcher"
+  mode: null, // null | "help" | "version" | "list" | "status" | "resolve" | "team" | "team-check" | "launcher"
   resolveName: null,
   launcherName: null,
   global: false,
@@ -445,9 +398,9 @@ for (let i = 0; i < rawArgs.length; i++) {
     break;
   }
 
-  // `--json` modifies --status only. Claimed before a mode exists so order does
-  // not matter, but never in launcher mode, where it belongs to pi.
-  if (a === "--json" && (state.mode === null || state.mode === "status")) {
+  // `--json` modifies --status or --team. Claimed before a mode exists so order
+  // does not matter, but never in launcher mode, where it belongs to pi.
+  if (a === "--json" && (state.mode === null || state.mode === "status" || state.mode === "team")) {
     state.json = true;
     continue;
   }
@@ -462,6 +415,16 @@ for (let i = 0; i < rawArgs.length; i++) {
   // unconditionally would break `pi-link foo --status`.
   if (a === "--status" && state.mode !== "launcher") {
     setMode("status");
+    continue;
+  }
+  // Team composition inspection. The wrapper's own modes only, and only before a
+  // session name has been seen — after that these belong to pi, like --status.
+  if (a === "--team" && state.mode !== "launcher") {
+    setMode("team");
+    continue;
+  }
+  if (a === "--team-check" && state.mode !== "launcher") {
+    setMode("team-check");
     continue;
   }
   if (a.startsWith("--resolve=")) {
@@ -497,6 +460,12 @@ for (let i = 0; i < rawArgs.length; i++) {
   }
   if (state.mode === "resolve") {
     fail(`--resolve accepts exactly one name; got extra: ${a}`);
+  }
+  if (state.mode === "team") {
+    fail(`--team does not accept arguments: ${a}\n  Usage: pi-link --team [--json]`);
+  }
+  if (state.mode === "team-check") {
+    fail(`--team-check does not accept arguments: ${a}\n  Usage: pi-link --team-check`);
   }
 
   // Phase 4: launcher mode entry. state.mode === null here, no name set yet.
@@ -549,8 +518,13 @@ if (state.mode === "resolve") {
 if (state.mode === "status" && state.global) {
   fail(`cannot combine --status and --global`);
 }
-if (state.json && state.mode !== "status") {
-  fail(`--json is only valid with --status`);
+// Team discovery reads one repository root, so a cross-cwd scope is meaningless
+// rather than merely unused — the same reasoning as --status above.
+if ((state.mode === "team" || state.mode === "team-check") && state.global) {
+  fail(`cannot combine --${state.mode === "team" ? "team" : "team-check"} and --global`);
+}
+if (state.json && state.mode !== "status" && state.mode !== "team") {
+  fail(`--json is only valid with --status or --team`);
 }
 if (state.mode === "launcher") {
   const normalized = normalizeName(state.launcherName);
@@ -580,6 +554,12 @@ switch (state.mode) {
     break;
   case "resolve":
     await runResolve(state);
+    break;
+  case "team":
+    await runTeam(state);
+    break;
+  case "team-check":
+    await runTeamCheck();
     break;
   case "launcher":
     await runLauncher(state);
@@ -776,6 +756,64 @@ async function runResolve(state) {
   console.error(`No session named "${name}" found${state.global ? "" : " in this cwd"}.`);
   if (!state.global) console.error("Use --global to search other cwds.");
   process.exit(2);
+}
+
+// Inspect the team composition rooted at the current directory. Read-only: this
+// reports what exists and what a manifest declares; it never writes or launches.
+async function runTeam(state) {
+  const inventory = await loadTeamInventory();
+  if (state.json) {
+    // Machine-readable form for launchers and CI. `existingDirs` is a Set and is
+    // deliberately omitted — it is an internal validation aid, not team state.
+    const { existingDirs: _ignored, ...reportable } = inventory;
+    console.log(JSON.stringify(reportable, null, 2));
+    return;
+  }
+  console.log(formatTeamReport(inventory));
+  if (inventory.manifest) {
+    console.log(`\nTeam: ${inventory.manifest.team?.name ?? "unnamed"}`);
+    console.log(`Group: ${inventory.manifest.team?.group ?? "unset"}`);
+    console.log(`Hub role: ${inventory.manifest.hub?.role ?? "unset"}`);
+    for (const [name, role] of Object.entries(inventory.manifest.roles ?? {})) {
+      console.log(`  ${name}${role.role ? ` (${role.role})` : ""}${role.linkName ? ` → ${role.linkName}` : ""}`);
+    }
+  }
+}
+
+// Validate the declared manifest against what discovery found. Exits nonzero on
+// a missing or invalid manifest, so a launcher or CI step can gate on it.
+async function runTeamCheck() {
+  const inventory = await loadTeamInventory();
+  if (!inventory.manifest) {
+    console.error("No team manifest found. Expected .pi-link/team.json.");
+    process.exit(1);
+  }
+  const result = validateTeamConfig(inventory.manifest, {
+    // A declared prompt/config is a file; a declared cwd/sessionDir is a
+    // directory. Both must already exist, so a manifest cannot promise a
+    // location the launcher would have to invent.
+    existingPaths: new Set([
+      ...inventory.profiles.map((profile) => profile.path),
+      ...inventory.sessionConfigs.map((config) => config.path),
+    ]),
+    existingDirs: inventory.existingDirs,
+    skillIds: new Set(inventory.skills.map((skill) => skill.id)),
+  });
+  for (const error of result.errors) console.error(`ERROR ${error}`);
+  for (const warning of result.warnings) console.error(`WARN ${warning}`);
+  if (result.errors.length) process.exit(1);
+  console.log(`Team manifest valid: ${inventory.manifest.manifestPath}`);
+}
+
+// A malformed manifest is a user error, not a crash: report it and exit nonzero
+// rather than surfacing a stack trace.
+async function loadTeamInventory() {
+  try {
+    return await discoverTeam(process.cwd());
+  } catch (error) {
+    console.error(`ERROR failed to read team manifest: ${error.message}`);
+    process.exit(1);
+  }
 }
 
 async function runLauncher(state) {

@@ -20,14 +20,14 @@ Use this skill when a user asks to discover, define, validate, or start a local 
 
 ## Discovery workflow
 
-1. Run `pi-link team discover` from the repository root.
+1. Run `pi-link --team` from the repository root.
 2. Inspect the discovered profiles, skills, and launch scripts.
 3. Read the relevant profile frontmatter and body for each proposed role.
 4. Identify an existing coordinator/advisor role if one exists.
 5. Identify the intended group name. Prefer a stable project/team slug.
 6. Identify required and optional skills from role prompts and repository instructions.
 7. Identify tools explicitly used by each role. Do not infer access from a role name.
-8. Run `pi-link team explain` and show the proposed composition to the user.
+8. Show the proposed composition to the user before writing anything.
 
 ## Interactive setup questions
 
@@ -62,8 +62,8 @@ Write `.pi-link/team.json` only after the user confirms the proposal. Reference 
 After writing, run:
 
 ```bash
-pi-link team check
-pi-link team show
+pi-link --team-check
+pi-link --team
 ```
 
 Report required errors separately from optional warnings. A missing optional skill should not be presented as a startup failure.

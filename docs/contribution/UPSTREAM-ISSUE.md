@@ -1,4 +1,4 @@
-# Upstream issue draft — `pi-link team` composition discovery
+# Upstream issue draft — team composition discovery for `pi-link`
 
 Status: **draft, not filed.** For review before anything is sent to `alvivar/pi-link`.
 
@@ -65,6 +65,15 @@ A CLI surface — **read-only first** — that:
 - reports required *errors* separately from optional *warnings*
 - exits non-zero on error, so it can gate a launcher or CI
 
+The surface is two flags, matching the convention upstream already established for
+`--list`, `--status` and `--resolve`:
+
+```text
+pi-link --team         # discovery report + declared manifest summary
+pi-link --team --json  # the same report, machine-readable for launchers/CI
+pi-link --team-check   # validate only; exit 1 on errors
+```
+
 Composition is deliberately a **thin manifest that references** existing files — never a copy
 of role prompts, skills, or project policy. Repository policy files keep their authority.
 
@@ -90,34 +99,36 @@ Sketch:
 - No new transport, no remote/LAN mode, no authentication. The existing localhost trust
   boundary and the existing group rule are unchanged.
 - No replacing or reimplementing group scoping. (That landed in 0.5.0 and is untouched.)
-- No process lifecycle in the first cut: no `team start` that spawns terminals.
+- No process lifecycle in the first cut: no `--team-start` that spawns terminals.
 - No capability granting. A manifest *declares intent*; Pi/OMP stays authoritative over what
   tools and skills actually exist at runtime.
 - No second message bus. Everything rides existing `link_send` semantics.
 
-## Open design questions for the maintainer
+## Design decisions
 
-These are the two we could not resolve alone, and both are reasons to ask before writing code.
+Both of the questions we flagged in the first draft are now settled in the implementation
+below. Neither needs a maintainer answer before review; both are easy to reverse if upstream
+disagrees.
 
-### 1. `team` as a subcommand vs a flag — this one may be disqualifying
+### 1. We use the flag form, not a subcommand
 
 Upstream deliberately **removed** the `list` / `resolve` subcommands in favor of `--list` /
 `--resolve` flags, specifically because the subcommand form made sessions named `list` or
 `resolve` unreachable (0.1.15 changelog: *"This fixes the reserved-word collision that
 prevented sessions named `list` or `resolve`…"*).
 
-A `pi-link team …` subcommand reintroduces exactly that collision. Verified against our
-prototype:
+A `pi-link team …` subcommand reintroduces exactly that collision. We verified it against the
+first prototype, where `team` was a subcommand:
 
 ```text
-pi-link team              -> exit 64, usage error
-pi-link team my-session   -> exit 64, usage error
-                          (upstream: would resolve/open the session "team")
+pi-link team              -> exit 64, usage error   (should resolve the session "team")
+pi-link team my-session   -> exit 64, usage error   (should open "my-session")
 ```
 
-So a session named `team` becomes unreachable. Given the maintainer already made this call once,
-the consistent shape is a flag form (`pi-link --team`, `--team-check`, …) or a distinct binary,
-not a subcommand. **We would rather match the existing convention than argue for ours.**
+**We changed it to flags** rather than argue for our shape. `pi-link team` now resolves a
+session named `team` again, and `--team` / `--team-check` join `--list`, `--status` and
+`--resolve` as modes. This is a design choice we made, not an open question — if upstream
+would rather have a subcommand, the change is contained to the arg parser.
 
 ### 2. Manifest format — we chose JSON-only to keep the single dependency
 
@@ -152,9 +163,8 @@ Available for review on a fork branch, with tests:
 
 https://github.com/kylebrodeur/pi-link/tree/feat/team-setup-discovery
 
-Read-only commands only (`discover`, `show`, `explain`, `check`), a companion skill, and
-Node's built-in test runner. Not opened as a PR — the two design questions above should be
-settled first, since both could change the shape of what lands.
+Read-only flags only (`--team`, `--team --json`, `--team-check`), a companion skill, and
+Node's built-in test runner. Not opened as a PR yet.
 
 ## Why not just a local convention?
 

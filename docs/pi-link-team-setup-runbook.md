@@ -1,6 +1,6 @@
-# `pi-link team` Runbook
+# `pi-link --team` Runbook
 
-Test the new `pi-link team` discovery commands **without touching the pi-link you already
+Test the new `pi-link --team` discovery flags **without touching the pi-link you already
 have installed**.
 
 ## What is currently installed (verified on this machine)
@@ -27,14 +27,17 @@ default profile has it.
 
 ## What this adds
 
-Additive CLI subcommands. No existing pi-link contract changes:
+Additive CLI modes. No existing pi-link contract changes, and no session name is captured:
 
 ```text
-pi-link team discover   # list profiles, skills, launch scripts, manifest
-pi-link team show       # discover + parsed manifest summary
-pi-link team explain    # human-readable discovery report
-pi-link team check      # validate manifest, exit 1 on errors
+pi-link --team         # discovery report + declared manifest summary
+pi-link --team --json  # the same report, machine-readable
+pi-link --team-check   # validate manifest, exit 1 on errors
 ```
+
+The flag form is required, not cosmetic: a `team` subcommand would make a session named
+`team` unreachable — the same reserved-word collision upstream removed in 0.1.15 by
+deleting the `list` and `resolve` subcommands.
 
 ## Isolation model — three independent layers
 
@@ -70,10 +73,10 @@ A local-path variant works too and is faster while iterating — it **symlinks**
 so your committed edits show up immediately with no reinstall:
 
 ```bash
-omp --profile runbook-test plugin install /private/tmp/pi-link-team-setup
-# ✔ Linked pi-link from /private/tmp/pi-link-team-setup
+omp --profile runbook-test plugin install /Users/kylebrodeur/workspace/pi-link
+# ✔ Linked pi-link from /Users/kylebrodeur/workspace/pi-link
 readlink ~/.omp/profiles/runbook-test/plugins/node_modules/pi-link
-# -> /private/tmp/pi-link-team-setup
+# -> /Users/kylebrodeur/workspace/pi-link
 ```
 
 ### Layer 2 — Pi project-local install
@@ -83,7 +86,7 @@ Verified: global Pi settings stayed clean (`pi-link in global: false`).
 
 ```bash
 mkdir -p /private/tmp/pi-scope && cd /private/tmp/pi-scope
-pi install -l --approve /private/tmp/pi-link-team-setup
+pi install -l --approve /Users/kylebrodeur/workspace/pi-link
 # writes .pi/settings.json -> {"packages":["../../pi-link-team-setup"]}
 
 rm -rf /private/tmp/pi-scope     # cleanup is just deleting the directory
@@ -99,8 +102,8 @@ local-path form above.
 Every command works with zero installation:
 
 ```bash
-CLI=/private/tmp/pi-link-team-setup/bin/pi-link.mjs
-node "$CLI" team discover
+CLI=/Users/kylebrodeur/workspace/pi-link/bin/pi-link.mjs
+node "$CLI" --team
 ```
 
 This touches nothing: no npm global, no OMP profile, no Pi settings, no `PATH`.
@@ -108,14 +111,14 @@ This touches nothing: no npm global, no OMP profile, no Pi settings, no `PATH`.
 ## Prerequisites
 
 ```bash
-cd /private/tmp/pi-link-team-setup
+cd /Users/kylebrodeur/workspace/pi-link
 npm install --omit=dev      # installs `ws`, the only runtime dep
 ```
 
 ## Step 1 — sanity checks
 
 ```bash
-cd /private/tmp/pi-link-team-setup
+cd /Users/kylebrodeur/workspace/pi-link
 node bin/pi-link.mjs --version          # 0.5.1
 node --test test/team-config.test.mjs test/cli-team.test.mjs   # 13 pass
 node --check bin/pi-link.mjs && node --check bin/team-config.mjs
@@ -162,13 +165,12 @@ JSON
 ## Step 3 — exercise the commands
 
 ```bash
-CLI=/private/tmp/pi-link-team-setup/bin/pi-link.mjs
+CLI=/Users/kylebrodeur/workspace/pi-link/bin/pi-link.mjs
 cd /private/tmp/pi-link-team-e2e
 
-node "$CLI" team discover    # 2 profiles, 1 skill, 1 launch script
-node "$CLI" team show        # adds Team/Group/Hub role + role lines
-node "$CLI" team explain     # report only
-node "$CLI" team check       # "Team manifest valid: ...", exit 0
+node "$CLI" --team           # 2 profiles, 1 skill, 1 launch script + manifest summary
+node "$CLI" --team --json    # same report, machine-readable
+node "$CLI" --team-check     # "Team manifest valid: ...", exit 0
 ```
 
 ## Step 4 — validation must reject bad input
@@ -189,7 +191,7 @@ cat > "$B/.pi-link/team.json" <<'JSON'
   }
 }
 JSON
-(cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR ... missing / exit=1
+(cd "$B" && node "$CLI" --team-check); echo "exit=$?"   # ERROR ... missing / exit=1
 
 # 4b. no hub at all -> exit 1
 cat > "$B/.pi-link/team.json" <<'JSON'
@@ -201,13 +203,13 @@ cat > "$B/.pi-link/team.json" <<'JSON'
   }
 }
 JSON
-(cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR hub.role is required / exit=1
+(cd "$B" && node "$CLI" --team-check); echo "exit=$?"   # ERROR hub.role is required / exit=1
 
 # 4c. malformed JSON -> clean error, exit 1 (no stack trace)
 cat > "$B/.pi-link/team.json" <<'JSON'
 { "version": 1, "roles": { "advisor": { "profile": [
 JSON
-(cd "$B" && node "$CLI" team check); echo "exit=$?"   # ERROR team manifest is not valid JSON / exit=1
+(cd "$B" && node "$CLI" --team-check); echo "exit=$?"   # ERROR team manifest is not valid JSON / exit=1
 ```
 
 ## Step 5 — packed artifact guard
@@ -215,12 +217,12 @@ JSON
 Catches a helper being excluded from the npm tarball.
 
 ```bash
-cd /private/tmp/pi-link-team-setup
+cd /Users/kylebrodeur/workspace/pi-link
 PKG=$(npm pack --silent | tail -1)
 tar -tzf "$PKG" | sort          # must list bin/pi-link.mjs AND bin/team-config.mjs
 D=$(mktemp -d); tar -xzf "$PKG" -C "$D"
 (cd "$D/package" && npm install --omit=dev --silent)
-(cd /private/tmp/pi-link-team-e2e && node "$D/package/bin/pi-link.mjs" team check)
+(cd /private/tmp/pi-link-team-e2e && node "$D/package/bin/pi-link.mjs" --team-check)
 rm -rf "$D"; rm -f "$PKG"
 ```
 
@@ -254,7 +256,7 @@ For Pi users to get the team commands via the github method, the code must be on
 | OMP profiles isolate plugins | fresh profile reported `No plugins installed` |
 | Installing into a profile leaves default untouched | `omp plugin list` identical before/after |
 | `omp` accepts `#branch` in a git spec | `git:...pi-link#feat/team-setup-discovery` installed fine |
-| `omp` local-path install symlinks | `readlink` → `/private/tmp/pi-link-team-setup` |
+| `omp` local-path install symlinks | `readlink` → `/Users/kylebrodeur/workspace/pi-link` |
 | Pi `-l` writes project-local settings only | `.pi/settings.json` written; global stayed `false` |
 | Pi github method ignores `#branch` | failed `is this a git repository?`; plain URL cloned `master` |
 | Installed `pi-link@0.5.1` lacks team code | `bin/` had only `pi-link.mjs` |
