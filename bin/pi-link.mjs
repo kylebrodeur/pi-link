@@ -807,12 +807,13 @@ async function runTeamCheck() {
 }
 
 // A malformed manifest is a user error, not a crash: report it and exit nonzero
-// rather than surfacing a stack trace.
+// rather than surfacing a stack trace. `parseManifestJson` already names the
+// manifest path, so the message is prefixed only with the severity marker.
 async function loadTeamInventory() {
   try {
     return await discoverTeam(process.cwd());
   } catch (error) {
-    console.error(`ERROR failed to read team manifest: ${error.message}`);
+    console.error(`ERROR ${error.message}`);
     process.exit(1);
   }
 }
