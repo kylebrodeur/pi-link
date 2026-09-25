@@ -32,6 +32,41 @@ test('loads a JSON team manifest and normalizes role paths relative to the repos
   assert.deepEqual(config.roles.advisor.tools.requestable, ['browser']);
 });
 
+test('a declared profile outside the scanned roots is not reported missing', async () => {
+  const root = await tempRepo();
+  // A role's profile may sit beside its own session dir rather than under a
+  // discovery root (`.omp/agents`). Real case: folia-app keeps
+  // `.omp/plantfluent-agents/plantfluent-pen-porter.md`. The discovery roots are
+  // a convention, not a constraint, so a declared path that exists on disk must
+  // validate.
+  await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
+  await fs.writeFile(
+    path.join(root, '.omp', 'plantfluent-agents', 'plantfluent-pen-porter.md'),
+    '---\nname: pen-porter\nmodel: kimi-k2.7-code\n---\nbody\n',
+  );
+  await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
+    version: 1,
+    team: { name: 'demo', group: 'demo' },
+    hub: { role: 'pen-porter' },
+    roles: {
+      'pen-porter': { profile: '.omp/plantfluent-agents/plantfluent-pen-porter.md' }
+    }
+  }));
+
+  const inventory = await discoverTeam(root);
+  // Discovery still does not treat it as a discoverable profile...
+  assert.deepEqual(inventory.profiles, []);
+  // ...but the declared path is recorded as existing, so validation passes.
+  const result = validateTeamConfig(inventory.manifest, {
+    existingPaths: inventory.existingPaths,
+    existingDirs: inventory.existingDirs,
+    skillIds: new Set(),
+    skills: []
+  });
+  assert.deepEqual(result.errors, []);
+});
+
 test('a YAML manifest is not picked up, so the JSON path stays authoritative', async () => {
   const root = await tempRepo();
   await fs.mkdir(path.join(root, '.pi-link'));

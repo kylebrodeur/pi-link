@@ -763,9 +763,10 @@ async function runResolve(state) {
 async function runTeam(state) {
   const inventory = await loadTeamInventory();
   if (state.json) {
-    // Machine-readable form for launchers and CI. `existingDirs` is a Set and is
-    // deliberately omitted — it is an internal validation aid, not team state.
-    const { existingDirs: _ignored, ...reportable } = inventory;
+    // Machine-readable form for launchers and CI. `existingDirs` and
+    // `existingPaths` are Sets and are deliberately omitted — they are internal
+    // validation aids, not team state.
+    const { existingDirs: _dirs, existingPaths: _paths, ...reportable } = inventory;
     console.log(JSON.stringify(reportable, null, 2));
     return;
   }
@@ -791,11 +792,9 @@ async function runTeamCheck() {
   const result = validateTeamConfig(inventory.manifest, {
     // A declared prompt/config is a file; a declared cwd/sessionDir is a
     // directory. Both must already exist, so a manifest cannot promise a
-    // location the launcher would have to invent.
-    existingPaths: new Set([
-      ...inventory.profiles.map((profile) => profile.path),
-      ...inventory.sessionConfigs.map((config) => config.path),
-    ]),
+    // location the launcher would have to invent. Discovery already recorded the
+    // declared paths that exist, including any outside a scanned root.
+    existingPaths: inventory.existingPaths,
     existingDirs: inventory.existingDirs,
     skillIds: new Set(inventory.skills.map((skill) => skill.id)),
     skills: inventory.skills,

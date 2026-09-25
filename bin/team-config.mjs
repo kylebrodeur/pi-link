@@ -276,7 +276,21 @@ export async function discoverTeam(root) {
       existingDirs.add(dir);
     }
   }
+  // A manifest may legitimately reference a file that exists outside the scanned
+  // roots — a role profile kept beside its own session dir, for instance. The
+  // discovery roots are a convention, not a constraint, so declared paths are
+  // verified against the filesystem and recorded here. Without this, a real file
+  // in an unconventional location is reported as missing.
+  const existingPaths = new Set([
+    ...profiles.map((profile) => profile.path),
+    ...sessionConfigs.map((config) => config.path),
+  ]);
   const declared = await loadTeamConfig(root);
+  for (const role of Object.values(declared?.roles ?? {})) {
+    for (const key of ['profile', 'prompt', 'config']) {
+      if (role[key] && (await exists(role[key]))) existingPaths.add(role[key]);
+    }
+  }
   for (const role of Object.values(declared?.roles ?? {})) {
     for (const key of ['cwd', 'sessionDir']) {
       if (role[key] && (await exists(role[key]))) existingDirs.add(role[key]);
@@ -291,6 +305,7 @@ export async function discoverTeam(root) {
     launchScripts: launchScripts.sort((a, b) => a.path.localeCompare(b.path)),
     sessionConfigs: sessionConfigs.sort((a, b) => a.id.localeCompare(b.id)),
     existingDirs,
+    existingPaths,
   };
 }
 
