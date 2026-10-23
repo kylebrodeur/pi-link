@@ -32,7 +32,7 @@
 - Modify: `test/team-config.test.mjs` — cover real YAML features accepted by the parser.
 - Modify: `test/cli-team.test.mjs` — add packed-artifact smoke coverage if practical.
 
-**Decision:** The Pi runtime currently has `yaml` 2.8.3 installed, but pi-link is independently published and cannot rely on another extension's transitive dependency. `pi-agent-bus` independently declares `js-yaml` as a direct dependency and parses Markdown frontmatter with it. Use a direct pi-link runtime dependency rather than a hidden reliance on Pi/OMP installation. Prefer the already-proven `yaml` package/API if package compatibility and lockfile resolution are straightforward; otherwise use direct `js-yaml` following agent-bus.
+**Decision:** The Pi runtime currently has `yaml` 2.8.3 installed, but pi-link is independently published and cannot rely on another extension's transitive dependency. A sibling extension declares `js-yaml` as a direct dependency and parses Markdown frontmatter with it. Use a direct pi-link runtime dependency rather than a hidden reliance on Pi/OMP installation. Prefer the already-proven `yaml` package/API if package compatibility and lockfile resolution are straightforward; otherwise use direct `js-yaml` following that precedent.
 
 **Steps:**
 
@@ -175,4 +175,4 @@ npm pack --dry-run
 npm test  # only if a repository test script exists by then
 ```
 
-Also verify against representative repository patterns from Enviro Grow, Folia, Slate, and pi-agent-bus without modifying those repositories.
+Also verify against representative repository patterns (multi-role and multi-root layouts) without modifying those repositories.

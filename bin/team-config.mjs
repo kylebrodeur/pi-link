@@ -280,7 +280,7 @@ async function readProfile(filePath, origin) {
     model: origin.declaredModel ?? frontmatter.model ?? null,
     skills: toStringList(frontmatter.autoloadSkills),
     // The terminal name a profile asks to be known by. A team calls this role
-    // "advisor" even when the profile file is `plantfluent-advisor.md`, so it is
+    // "advisor" even when the profile file is `generic-advisor.md`, so it is
     // the name a manifest and `--hub` should use.
     linkName: frontmatter.linkName ?? null,
     loadable,
@@ -770,7 +770,7 @@ export function buildTeamManifest(inventory, options = {}) {
     .filter((profile) => profile.source === 'project' || profile.source === 'declared');
   // A role is keyed by the name the team actually calls it — the profile's
   // declared `linkName` when present, else its id. A repo whose files are
-  // `plantfluent-advisor.md` still has a role called `advisor`, and the manifest
+  // `generic-advisor.md` still has a role called `advisor`, and the manifest
   // is written in the vocabulary the team uses (`--hub advisor` must resolve).
   const roleName = (profile) => profile.linkName ?? profile.id;
   const byId = new Map(candidates.map((profile) => [roleName(profile), profile]));

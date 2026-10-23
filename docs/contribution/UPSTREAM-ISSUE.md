@@ -159,9 +159,9 @@ small change; everything else in the prototype is unaffected.
 
 ## Reference implementation
 
-Available for review on a fork branch, with tests:
+Available for review on a fork branch, with tests. Paste the branch URL before filing:
 
-https://github.com/kylebrodeur/pi-link/tree/feat/team-setup-discovery
+https://github.com/alvivar/pi-link/tree/feat/team-setup-discovery
 
 Read-only flags only (`--team`, `--team --json`, `--team-check`), a companion skill, and
 Node's built-in test runner. Not opened as a PR yet.

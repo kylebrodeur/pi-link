@@ -2,8 +2,8 @@
 
 Practical migration for an existing multi-agent repo — the kind that already has
 a launcher script, agent profiles, and (often) a Zellij or tmux layout. Written
-from the two repos we migrated: `folia-app` (six roles) and `enviro-grow-pico`
-(four roles, `iot-rig`).
+from two repos we migrated this way (one with six roles, one with four roles
+and an `iot-rig`).
 
 This is an internal document. It is not part of the upstream contribution.
 
@@ -40,8 +40,8 @@ A launcher that hardcodes each role's model, cwd and prompt path is a second
 description of the same team, and the two disagree silently.
 
 Real example from this migration: a role file lived at
-`.omp/plantfluent-agents/plantfluent-pen-porter.md`, but the launcher derived its
-prompt path from a naming convention (`.omp/agents/plantfluent-<role>.md`). That
+`.omp/generic-agents/generic-pen-porter.md`, but the launcher derived its
+prompt path from a naming convention (`.omp/agents/generic-<role>.md`). That
 file did not exist, so the launcher fell back to a placeholder and the role
 started with a 19-byte stub prompt instead of its 1.5 KB profile — for months,
 without an error. The manifest declared the correct path the whole time. Nothing
@@ -264,8 +264,9 @@ To test as a plugin without disturbing an existing install, use an isolated OMP
 profile. A `#branch` spec pulls the **pushed** tip, not local commits:
 
 ```bash
+# The fork branch that carries this work (push yours, then substitute its URL):
 omp --profile team-test plugin install \
-  'git:github.com/kylebrodeur/pi-link#feat/team-setup-discovery'
+  'git:github.com/alvivar/pi-link#feat/team-setup-discovery'
 omp --profile team-test plugin list      # only pi-link
 omp plugin list                          # default profile unchanged
 ```
@@ -292,10 +293,10 @@ launcher no longer restates them. It also carries `model`, so a role launches on
 the model its profile declares rather than the harness default.
 
 What remains is `model` stated in two places for a repo that keeps its old
-launcher: `folia-app`'s `case` block and its profile frontmatter both name the
-model, and nothing enforces that they agree. Repos that launch through
-`--team-run` have no such duplication, because the manifest is the only place
-`--model` comes from.
+launcher: the `case` block in its start script and the profile frontmatter
+both name the model, and nothing enforces that they agree. Repos that launch
+through `--team-run` have no such duplication, because the manifest is the
+only place `--model` comes from.
 
 What the manifest catches is the failure, not the redundancy: a profile deleted,
 a session dir claimed by two roles, a required skill removed, a `cwd` that moved,

@@ -71,11 +71,12 @@ npm install --no-save --no-audit --no-fund oxlint@^1.85.0 @oxlint/plugins@^1.85.
 The rule tree is copied from the neutral source of truth and must stay identical:
 
 ```bash
-diff -rq ~/workspace/component-tools/anti-slop/ tools/oxlint/anti-slop/   # empty
+diff -rq /path/to/anti-slop-kit/anti-slop/ tools/oxlint/anti-slop/   # empty
 ```
 
-15 rules, 3 shared helpers, plus the SoT README. No product group (`folia/`,
-`uofd/`) is vendored — those stay local to repos that own such policy.
+15 rules, 3 shared helpers, plus the SoT README. No product group (private
+product rule trees) is vendored — those stay local to repos that own such
+policy.
 
 ## Run it
 
@@ -178,7 +179,7 @@ Anyone running the recipe's hook where those are exported — a worktree, or a
 ## Re-verifying the gate end to end
 
 ```bash
-cd /Users/kylebrodeur/workspace/pi-link
+cd $HOME/repos/pi-link-clone
 
 # 1. slop must be blocked
 printf 'export function f(v){ if (typeof v === "string") return 1; return 2; }\n' > tmp-slop.mjs

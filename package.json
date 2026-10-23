@@ -2,7 +2,6 @@
   "name": "pi-link",
   "version": "0.6.0",
   "description": "WebSocket-based inter-terminal communication for Pi. Connect multiple Pi terminals over a local link network.",
-  "author": "alvivar",
   "license": "MIT",
   "bin": {
     "pi-link": "bin/pi-link.mjs"
@@ -15,10 +14,21 @@
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "start": "node bin/pi-link.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/alvivar/pi-link.git"
   },
+  "author": "alvivar",
   "keywords": [
     "pi-package",
     "pi",
@@ -27,12 +37,6 @@
     "terminal",
     "multi-agent"
   ],
-  "dependencies": {
-    "ws": "^8.20.0"
-  },
-  "devDependencies": {
-    "@types/ws": "^8.18.1"
-  },
   "pi": {
     "extensions": [
       "./index.ts"

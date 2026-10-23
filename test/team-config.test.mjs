@@ -35,22 +35,22 @@ test('loads a JSON team manifest and normalizes role paths relative to the repos
 test('a declared profile outside every harness root validates, and warns it will not load', async () => {
   const root = await tempRepo();
   // A role's profile may sit beside its own session dir rather than under a
-  // discovery root (`.omp/agents`). Real case: folia-app keeps
-  // `.omp/plantfluent-agents/plantfluent-pen-porter.md`, and its launcher reads
+  // discovery root (`.omp/agents`). Real case: a sibling repo keeps
+  // `.omp/generic-agents/generic-pen-porter.md`, and its launcher reads
   // that path directly. So it must validate — but OMP would not load it as a
   // subagent, and that difference has to be visible.
-  await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.omp', 'generic-agents'), { recursive: true });
   await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
   await fs.writeFile(
-    path.join(root, '.omp', 'plantfluent-agents', 'plantfluent-pen-porter.md'),
-    '---\nname: pen-porter\nmodel: kimi-k2.7-code\n---\nbody\n',
+    path.join(root, '.omp', 'generic-agents', 'generic-pen-porter.md'),
+    '---\nname: pen-porter\nmodel: generic-model\n---\nbody\n',
   );
   await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
     version: 1,
     team: { name: 'demo', group: 'demo' },
     hub: { role: 'pen-porter' },
     roles: {
-      'pen-porter': { profile: '.omp/plantfluent-agents/plantfluent-pen-porter.md' }
+      'pen-porter': { profile: '.omp/generic-agents/generic-pen-porter.md' }
     }
   }));
 
@@ -80,10 +80,10 @@ test('a declared profile outside every harness root validates, and warns it will
 // Dropping them would make `--team-init` shrink a working team.
 test('rebuilding a manifest preserves an out-of-root role and its launch facts', async () => {
   const root = await tempRepo();
-  await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.omp', 'generic-agents'), { recursive: true });
   await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
   await fs.writeFile(
-    path.join(root, '.omp', 'plantfluent-agents', 'pen-porter.md'),
+    path.join(root, '.omp', 'generic-agents', 'pen-porter.md'),
     '# Pen porter\n\nOwn the conversion lane.\n',
   );
   await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
@@ -92,10 +92,10 @@ test('rebuilding a manifest preserves an out-of-root role and its launch facts',
     hub: { role: 'pen-porter' },
     roles: {
       'pen-porter': {
-        profile: '.omp/plantfluent-agents/pen-porter.md',
+        profile: '.omp/generic-agents/pen-porter.md',
         role: 'Pen Porter / Storybook',
         cwd: '.',
-        sessionDir: '.omp/plantfluent-agents/pen-porter',
+        sessionDir: '.omp/generic-agents/pen-porter',
         config: '.omp/light-session.yml',
       }
     }
@@ -105,12 +105,12 @@ test('rebuilding a manifest preserves an out-of-root role and its launch facts',
   const { manifest } = buildTeamManifest(inventory, { hub: 'pen-porter' });
   const role = manifest.roles['pen-porter'];
   assert.ok(role, 'the out-of-root role must survive a rebuild');
-  assert.equal(role.profile, '.omp/plantfluent-agents/pen-porter.md');
+  assert.equal(role.profile, '.omp/generic-agents/pen-porter.md');
   assert.equal(role.role, 'Pen Porter / Storybook');
   // Repo-relative, not the absolute paths loadTeamConfig resolves on read — a
   // committed manifest must work on another machine.
   assert.equal(role.cwd, '.');
-  assert.equal(role.sessionDir, '.omp/plantfluent-agents/pen-porter');
+  assert.equal(role.sessionDir, '.omp/generic-agents/pen-porter');
   assert.equal(role.config, '.omp/light-session.yml');
   assert.equal(manifest.hub.role, 'pen-porter');
 });
@@ -173,7 +173,7 @@ test('a Pi-resolvable root does not warn, because Pi loads it', async () => {
     await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
     await fs.writeFile(
       path.join(root, dir, 'builder.md'),
-      '---\nname: builder\ndescription: member\nmodel: kimi-k2.7-code\n---\nbody\n',
+      '---\nname: builder\ndescription: member\nmodel: generic-model\n---\nbody\n',
     );
     await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
       version: 1,
@@ -474,14 +474,14 @@ test('builder output round-trips through the validator', async () => {
 });
 
 // A role is named the way the team names it. A repo whose file is
-// `plantfluent-advisor.md` has a role called `advisor`, so `--hub advisor` must
+// `generic-advisor.md` has a role called `advisor`, so `--hub advisor` must
 // resolve rather than silently failing to match anything.
 test('builder keys roles by declared linkName, not the profile filename', async () => {
   const root = await tempRepo();
   await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
   await fs.writeFile(
-    path.join(root, '.omp', 'agents', 'plantfluent-advisor.md'),
-    '---\nname: plantfluent-advisor\ndescription: d\nlinkName: advisor\n---\nbody\n',
+    path.join(root, '.omp', 'agents', 'generic-advisor.md'),
+    '---\nname: generic-advisor\ndescription: d\nlinkName: advisor\n---\nbody\n',
   );
 
   const inventory = await discoverTeam(root);
@@ -560,22 +560,21 @@ test('profilePromptBody strips frontmatter and keeps the body', () => {
 });
 
 // The point of the launch plan: profile paths come from the manifest, not from a
-// filename convention. This is the `pen-porter` failure — a role whose profile
-// sits outside `.omp/agents/` got a stub prompt because the launcher derived the
-// path instead of reading it.
+// filename convention. A role whose profile sits outside `.omp/agents/` got a
+// stub prompt because the launcher derived the path instead of reading it.
 test('launch plan resolves a profile that sits outside the naming convention', async () => {
   const root = await tempRepo();
-  await fs.mkdir(path.join(root, '.omp', 'plantfluent-agents'), { recursive: true });
+  await fs.mkdir(path.join(root, '.omp', 'generic-agents'), { recursive: true });
   await fs.mkdir(path.join(root, '.pi-link'), { recursive: true });
   await fs.writeFile(
-    path.join(root, '.omp', 'plantfluent-agents', 'pen-porter.md'),
+    path.join(root, '.omp', 'generic-agents', 'pen-porter.md'),
     '---\nname: pen-porter\n---\nYou port pens.\n',
   );
   await fs.writeFile(path.join(root, '.pi-link', 'team.json'), JSON.stringify({
     version: 1,
     team: { name: 'demo', group: 'demo' },
     hub: { role: 'pen-porter' },
-    roles: { 'pen-porter': { profile: '.omp/plantfluent-agents/pen-porter.md' } }
+    roles: { 'pen-porter': { profile: '.omp/generic-agents/pen-porter.md' } }
   }));
 
   const inventory = await discoverTeam(root);
@@ -684,7 +683,7 @@ test('launch plan passes the model from the manifest, then from the profile', as
     roles: {
       'from-profile': { profile: '.omp/agents/from-profile.md' },
       // An explicit model wins over the profile's, so a manifest can override.
-      'from-manifest': { profile: '.omp/agents/from-manifest.md', model: 'kimi-k2.7-code' },
+      'from-manifest': { profile: '.omp/agents/from-manifest.md', model: 'generic-model' },
     }
   }));
 
@@ -692,7 +691,7 @@ test('launch plan passes the model from the manifest, then from the profile', as
   const plan = await resolveLaunchPlan(inventory);
   const byName = new Map(plan.roles.map((role) => [role.name, role]));
   assert.equal(byName.get('from-profile').model, 'glm-5.3');
-  assert.equal(byName.get('from-manifest').model, 'kimi-k2.7-code');
+  assert.equal(byName.get('from-manifest').model, 'generic-model');
   assert.ok(byName.get('from-profile').argv.includes('--model'));
   assert.equal(byName.get('from-profile').argv[byName.get('from-profile').argv.indexOf('--model') + 1], 'glm-5.3');
 });
@@ -713,8 +712,8 @@ test('builder records the profile model in the manifest', async () => {
 
 // A role whose profile sits outside every discovery root has an unread
 // frontmatter, so no model is known. The harness default then applies, and that
-// must be reported rather than passed over — the same failure shape as the
-// pen-porter stub, where a silent fallback stood in for the real thing.
+// must be reported rather than passed over — the same failure shape as any role
+// whose profile is only reachable by path.
 test('launch plan warns when no model is known for a role', async () => {
   const root = await tempRepo();
   await fs.mkdir(path.join(root, '.omp', 'agents'), { recursive: true });
@@ -880,14 +879,14 @@ test('readKnownModels unions the harness registries and tolerates absence', asyn
   };
   const readTextFile = async (p) => {
     if (!p.includes('.pi')) throw new Error('ENOENT');
-    return JSON.stringify({ enabledModels: ['ollama/kimi-k2.7-code:cloud'] });
+    return JSON.stringify({ enabledModels: ['ollama/generic-model:cloud'] });
   };
 
   const known = await readKnownModels(runCommand, readTextFile);
   assert.ok(known.has('glm-5.3'));
   assert.ok(known.has('ollama-cloud/glm-5.3'));
   assert.ok(known.has('GLM-5.3'));
-  assert.ok(known.has('ollama/kimi-k2.7-code:cloud'));
+  assert.ok(known.has('ollama/generic-model:cloud'));
 
   // Both sources unavailable yields null, so validation skips the check rather
   // than rejecting every model.

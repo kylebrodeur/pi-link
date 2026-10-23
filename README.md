@@ -444,7 +444,7 @@ Root: ~/my-project
 Manifest: ~/my-project/.pi-link/team.json
 Profiles available (2):
   [project omp] advisor (coordinator) · glm-5.2:cloud — ~/my-project/.omp/agents/advisor.md
-  [project pi] builder (member) · kimi-k2.7-code:cloud — ~/my-project/.pi/agents/builder.md
+  [project pi] builder (member) · generic-model:cloud — ~/my-project/.pi/agents/builder.md
 Skills (1): team-workflow
 Launch scripts (1):
   start-team.sh — ~/my-project/scripts/start-team.sh
@@ -485,7 +485,7 @@ A declared `profile` that exists but sits **outside every harness's agent roots*
 $ pi-link --team-init --write --hub advisor --group my-team
 ```
 
-Paths come from discovery; the hub comes from `--hub`. Anything discovery cannot know — `cwd`, `sessionDir`, `config` — is **omitted rather than invented**, so `--team-check` reports the gaps instead of the manifest asserting a guess. Roles are keyed by the profile's declared `linkName` when it has one, so a file named `plantfluent-advisor.md` yields a role called `advisor`. User-level profiles are excluded: their absolute paths are machine-local and would break for every other clone.
+Paths come from discovery; the hub comes from `--hub`. Anything discovery cannot know — `cwd`, `sessionDir`, `config` — is **omitted rather than invented**, so `--team-check` reports the gaps instead of the manifest asserting a guess. Roles are keyed by the profile's declared `linkName` when it has one, so a file named `generic-advisor.md` yields a role called `advisor`. User-level profiles are excluded: their absolute paths are machine-local and would break for every other clone.
 
 **Launching from a manifest.** `pi-link --team-run` starts every role the manifest declares, reading the profile path, `cwd`, `sessionDir`, `config`, `linkName` and `model` from the manifest rather than deriving them from a naming convention:
 

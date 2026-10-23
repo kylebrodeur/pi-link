@@ -6,7 +6,7 @@ have installed**.
 ## What is currently installed (verified on this machine)
 
 ```text
-omp 18.2.1                        /Users/kylebrodeur/.local/bin/omp
+omp 18.2.1                        /usr/local/bin/omp
 pi  0.84.4                        node v22.23.2 global
 pi-link@0.5.1                     npm plugin, enabled in OMP's DEFAULT profile
   path: ~/.omp/plugins/node_modules/pi-link
@@ -53,9 +53,10 @@ There are three safe ways to test, in order of preference. **Layer 1 is the impo
 # Prove the default install is untouched before/after
 omp plugin list                       # 3 plugins incl. pi-link@0.5.1
 
-# Install the branch into a throwaway profile (github method, branch ref works here)
+# Install the branch into a throwaway profile (github method, branch ref works here).
+# The fork branch that carries this work (push yours, then substitute its URL):
 omp --profile runbook-test plugin install \
-  'git:github.com/kylebrodeur/pi-link#feat/team-setup-discovery'
+  'git:github.com/alvivar/pi-link#feat/team-setup-discovery'
 
 # The profile sees only itself ...
 omp --profile runbook-test plugin list          # just pi-link
@@ -73,10 +74,10 @@ A local-path variant works too and is faster while iterating — it **symlinks**
 so your committed edits show up immediately with no reinstall:
 
 ```bash
-omp --profile runbook-test plugin install /Users/kylebrodeur/workspace/pi-link
-# ✔ Linked pi-link from /Users/kylebrodeur/workspace/pi-link
+omp --profile runbook-test plugin install $HOME/repos/pi-link-clone
+# ✔ Linked pi-link from $HOME/repos/pi-link-clone
 readlink ~/.omp/profiles/runbook-test/plugins/node_modules/pi-link
-# -> /Users/kylebrodeur/workspace/pi-link
+# -> $HOME/repos/pi-link-clone
 ```
 
 ### Layer 2 — Pi project-local install
@@ -86,13 +87,13 @@ Verified: global Pi settings stayed clean (`pi-link in global: false`).
 
 ```bash
 mkdir -p /private/tmp/pi-scope && cd /private/tmp/pi-scope
-pi install -l --approve /Users/kylebrodeur/workspace/pi-link
+pi install -l --approve $HOME/repos/pi-link-clone
 # writes .pi/settings.json -> {"packages":["../../pi-link-team-setup"]}
 
 rm -rf /private/tmp/pi-scope     # cleanup is just deleting the directory
 ```
 
-**Pi's github method is default-branch only.** Verified: `git:github.com/kylebrodeur/pi-link`
+**Pi's github method is default-branch only.** Verified: `git:github.com/alvivar/pi-link`
 clones `master` (commit `a7c1851`) and does **not** understand `#branch` — it fails with
 `is this a git repository?`. So for Pi, either merge the branch to master first, or use the
 local-path form above.
@@ -102,7 +103,7 @@ local-path form above.
 Every command works with zero installation:
 
 ```bash
-CLI=/Users/kylebrodeur/workspace/pi-link/bin/pi-link.mjs
+CLI=$HOME/repos/pi-link-clone/bin/pi-link.mjs
 node "$CLI" --team
 ```
 
@@ -111,14 +112,14 @@ This touches nothing: no npm global, no OMP profile, no Pi settings, no `PATH`.
 ## Prerequisites
 
 ```bash
-cd /Users/kylebrodeur/workspace/pi-link
+cd $HOME/repos/pi-link-clone
 npm install --omit=dev      # installs `ws`, the only runtime dep
 ```
 
 ## Step 1 — sanity checks
 
 ```bash
-cd /Users/kylebrodeur/workspace/pi-link
+cd $HOME/repos/pi-link-clone
 node bin/pi-link.mjs --version          # 0.5.1
 node --test test/team-config.test.mjs test/cli-team.test.mjs   # 13 pass
 node --check bin/pi-link.mjs && node --check bin/team-config.mjs
@@ -165,7 +166,7 @@ JSON
 ## Step 3 — exercise the commands
 
 ```bash
-CLI=/Users/kylebrodeur/workspace/pi-link/bin/pi-link.mjs
+CLI=$HOME/repos/pi-link-clone/bin/pi-link.mjs
 cd /private/tmp/pi-link-team-e2e
 
 node "$CLI" --team           # 2 profiles, 1 skill, 1 launch script + manifest summary
@@ -217,7 +218,7 @@ JSON
 Catches a helper being excluded from the npm tarball.
 
 ```bash
-cd /Users/kylebrodeur/workspace/pi-link
+cd $HOME/repos/pi-link-clone
 PKG=$(npm pack --silent | tail -1)
 tar -tzf "$PKG" | sort          # must list bin/pi-link.mjs AND bin/team-config.mjs
 D=$(mktemp -d); tar -xzf "$PKG" -C "$D"
@@ -240,7 +241,7 @@ omp plugin list        # confirm still pi-context, pi-link@0.5.1, superpowers
 Nothing above changes `master` or the installed pi-link. To ship:
 
 ```bash
-cd /Users/kylebrodeur/workspace/pi-link
+cd $HOME/repos/pi-link-clone
 git merge feat/team-setup-discovery    # fast-forwardable from a7c1851
 git push origin master
 ```
@@ -257,7 +258,7 @@ For Pi users to get the team commands via the github method, the code must be on
 | Installing into a profile leaves default untouched | `omp plugin list` identical before/after |
 | `omp` accepts `#branch` in a git spec | `git:...pi-link#feat/team-setup-discovery` installed fine |
 | A `#branch` spec pulls the **pushed** tip, not local commits | install reported `0.5.1`/subcommand form, matching `origin` tip `442930b`, not local HEAD |
-| `omp` local-path install symlinks | `readlink` → `/Users/kylebrodeur/workspace/pi-link` |
+| `omp` local-path install symlinks | `readlink` → `$HOME/repos/pi-link-clone` |
 | Pi `-l` writes project-local settings only | `.pi/settings.json` written; global stayed `false` |
 | Pi github method ignores `#branch` | failed `is this a git repository?`; plain URL cloned `master` |
 | Installed `pi-link@0.5.1` lacks team code | `bin/` had only `pi-link.mjs` |
